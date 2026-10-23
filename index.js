@@ -24,7 +24,57 @@ export default {
     }
 
     // Health check
-    if (url.pathname === "/health" && request.method === "GET") {
+    // Health check and Telegram token verification
+if (url.pathname === "/health" && request.method === "GET") {
+  let telegramBot = {
+    checked: false,
+    message: "Telegram bot token is not configured"
+  };
+
+  if (env.TELEGRAM_BOT_TOKEN) {
+    try {
+      const telegramResponse = await fetch(
+        "https://api.telegram.org/bot" +
+        env.TELEGRAM_BOT_TOKEN +
+        "/getMe"
+      );
+
+      const telegramResult = await telegramResponse.json();
+
+      telegramBot = telegramResult.ok
+        ? {
+            checked: true,
+            valid: true,
+            username: telegramResult.result.username
+          }
+        : {
+            checked: true,
+            valid: false,
+            message: "Telegram rejected the configured token"
+          };
+    } catch {
+      telegramBot = {
+        checked: true,
+        valid: false,
+        message: "Could not contact Telegram"
+      };
+    }
+  }
+
+  return respond({
+    ok: true,
+    service: "Rapid Ads API",
+    status: "running",
+    balanceStorageConfigured: Boolean(
+      env.RAPID_ADS_BALANCES
+    ),
+    secretConfigured: Boolean(env.TBC_API_SECRET),
+    telegramBotTokenConfigured: Boolean(
+      env.TELEGRAM_BOT_TOKEN
+    ),
+    telegramBot
+  });
+}
       return respond({
         ok: true,
         service: "Rapid Ads API",
