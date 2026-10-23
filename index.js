@@ -443,4 +443,31 @@ export default {
         return respond({
           ok: true,
           message: "Balance snapshot saved",
-          user_id
+          user_id: userId
+        });
+      } catch {
+        return respond({
+          ok: false,
+          error: "Storage operation failed"
+        }, 500);
+      }
+    }
+
+    // ==========================================
+    // 4. HANDLE OTHER REQUESTS
+    // ==========================================
+    if (request.method !== "GET") {
+      return respond({
+        ok: false,
+        error: "Method not allowed"
+      }, 405);
+    }
+
+    return respond({
+      ok: true,
+      service: "Rapid Ads API",
+      message:
+        "Backend is running. No rewards have been credited."
+    });
+  }
+};
