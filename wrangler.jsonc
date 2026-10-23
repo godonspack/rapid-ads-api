@@ -2,5 +2,11 @@
 "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
 "name": "rapid-ads-api",
 "main": "index.js",
-"compatibility_date": "2026-10-23"
+"compatibility_date": "2026-10-23",
+"kv_namespaces": [
+{
+"binding": "RAPID_ADS_BALANCES",
+"id": "9335d0345de1406da1a65818138d320c"
+}
+]
 }
