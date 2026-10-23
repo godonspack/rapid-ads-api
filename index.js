@@ -161,15 +161,12 @@ export default {
           .map(byte => byte.toString(16).padStart(2, "0"))
           .join("");
 
-        if (
-          calculatedHash.length !== receivedHash.length ||
-          !crypto.subtle
-        ) {
-          return respond({
-            ok: false,
-            error: "Telegram authentication failed"
-          }, 401);
-        }
+        if (calculatedHash.length !== receivedHash.length) {
+  return respond({
+    ok: false,
+    error: "Telegram authentication failed"
+  }, 401);
+}
 
         // Compare the two hashes without an early character-by-character exit.
         let difference = 0;
