@@ -113,9 +113,13 @@ export default {
         params.delete("hash");
 
         const dataCheckString = [...params.entries()]
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([key, value]) => `${key}=${value}`)
-          .join("\n");
+  .sort(([a], [b]) => {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+  })
+  .map(([key, value]) => `${key}=${value}`)
+  .join("\n");
 
         const encoder = new TextEncoder();
 
