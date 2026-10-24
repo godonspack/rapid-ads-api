@@ -822,7 +822,94 @@ export default {
     }, 500);
   }
     }
+// ==========================================
+// TEST: SEND JSON TO TELEBOT CREATOR
+// ==========================================
+if (
+url.pathname === "/tbc-test" &&
+request.method === "POST"
+) {
+if (!env.TBC_TEST_WEBHOOK_URL) {
+return respond({
+ok: false,
+error: "TBC test webhook secret is not configured"
+}, 503);
+}
 
+  const authorization =
+    request.headers.get("Authorization");
+
+  if (
+    !env.TBC_API_SECRET ||
+    authorization !== `Bearer ${env.TBC_API_SECRET}`
+  ) {
+    return respond({
+      ok: false,
+      error: "Unauthorized"
+    }, 401);
+  }
+
+  let data;
+
+  try {
+    data = await request.json();
+  } catch {
+    return respond({
+      ok: false,
+      error: "Invalid JSON"
+    }, 400);
+  }
+
+  const testId = String(data.test_id || "");
+
+  if (
+    testId !== "rapid-ads-tbc-connection-test"
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid test identifier"
+    }, 400);
+  }
+
+  try {
+    const tbcResponse = await fetch(
+      env.TBC_TEST_WEBHOOK_URL,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          source: "Rapid Ads Cloudflare Worker",
+          test_id: testId,
+          test_only: true,
+          reward_crediting: false
+        })
+      }
+    );
+
+    const responseText =
+      await tbcResponse.text();
+
+    return respond({
+      ok: tbcResponse.ok,
+      test_only: true,
+      tbc_http_status: tbcResponse.status,
+      tbc_response: responseText.slice(0, 500),
+      message: tbcResponse.ok
+        ? "TBC webhook request sent"
+        : "TBC webhook returned an error"
+    }, tbcResponse.ok ? 200 : 502);
+
+  } catch (error) {
+    console.error("TBC test webhook failed:", error);
+
+    return respond({
+      ok: false,
+      error: "Could not contact TBC webhook"
+    }, 502);
+  }
+    }
     // ==========================================
     // 5. HANDLE OTHER REQUESTS
     // ==========================================
