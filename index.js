@@ -601,34 +601,126 @@ export default {
       }
 
       try {
-        // Reuse the existing authenticated balance endpoint.
-        const authResponse = await fetch(
-          new URL("/balance", url.origin).toString(),
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              initData: initData
-            })
-          }
-        );
+        // Verify Telegram Mini App authentication directly.
+        const params = new URLSearchParams(initData);
 
-        const authResult = await authResponse.json();
+        const receivedHash = params.get("hash");
+        const authDate = Number(params.get("auth_date"));
+        const userJson = params.get("user");
 
         if (
-          !authResponse.ok ||
-          authResult.ok !== true ||
-          !authResult.user_id
+          !receivedHash ||
+          !/^[a-f0-9]{64}$/i.test(receivedHash) ||
+          !Number.isSafeInteger(authDate) ||
+          !userJson
         ) {
+          return respond({
+            ok: false,
+            error: "Invalid Telegram authentication data"
+          }, 401);
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+
+        if (
+          authDate > now + 60 ||
+          now - authDate > 86400
+        ) {
+          return respond({
+            ok: false,
+            error: "Telegram authentication has expired"
+          }, 401);
+        }
+
+        params.delete("hash");
+
+        const dataCheckString = [...params.entries()]
+          .sort(([a], [b]) => {
+            if (a < b) return -1;
+            if (a > b) return 1;
+            return 0;
+          })
+          .map(([key, value]) => `${key}=${value}`)
+          .join("\n");
+
+        const encoder = new TextEncoder();
+
+        const secretKeyMaterial = await crypto.subtle.importKey(
+          "raw",
+          encoder.encode("WebAppData"),
+          {
+            name: "HMAC",
+            hash: "SHA-256"
+          },
+          false,
+          ["sign"]
+        );
+
+        const secretKeyBytes = await crypto.subtle.sign(
+          "HMAC",
+          secretKeyMaterial,
+          encoder.encode(env.TELEGRAM_BOT_TOKEN)
+        );
+
+        const secretKey = await crypto.subtle.importKey(
+          "raw",
+          secretKeyBytes,
+          {
+            name: "HMAC",
+            hash: "SHA-256"
+          },
+          false,
+          ["sign"]
+        );
+
+        const calculatedHashBytes = await crypto.subtle.sign(
+          "HMAC",
+          secretKey,
+          encoder.encode(dataCheckString)
+        );
+
+        const calculatedHash = Array.from(
+          new Uint8Array(calculatedHashBytes)
+        )
+          .map(byte => byte.toString(16).padStart(2, "0"))
+          .join("");
+
+        const normalizedHash = receivedHash.toLowerCase();
+
+        let difference = 0;
+
+        for (let i = 0; i < calculatedHash.length; i++) {
+          difference |=
+            calculatedHash.charCodeAt(i) ^
+            normalizedHash.charCodeAt(i);
+        }
+
+        if (difference !== 0) {
           return respond({
             ok: false,
             error: "Telegram authentication failed"
           }, 401);
         }
 
-        const userId = String(authResult.user_id);
+        let telegramUser;
+
+        try {
+          telegramUser = JSON.parse(userJson);
+        } catch {
+          return respond({
+            ok: false,
+            error: "Invalid Telegram user data"
+          }, 401);
+        }
+
+        const userId = String(telegramUser.id ?? "");
+
+        if (!/^\d+$/.test(userId) || userId.length > 20) {
+          return respond({
+            ok: false,
+            error: "Invalid Telegram user ID"
+          }, 401);
+        }
 
         // Never overwrite an existing session ID.
         const sessionKey = `monetag:session:${ymid}`;
