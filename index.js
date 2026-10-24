@@ -452,6 +452,221 @@ export default {
         }, 500);
       }
     }
+        // ==========================================
+    // 4. REGISTER MONETAG ADVERTISEMENT SESSION
+    // ==========================================
+    if (
+      url.pathname === "/monetag-register" &&
+      request.method === "POST"
+    ) {
+      if (
+        !env.TELEGRAM_BOT_TOKEN ||
+        !env.RAPID_ADS_BALANCES
+      ) {
+        return respond({
+          ok: false,
+          error: "Server configuration incomplete"
+        }, 503);
+      }
+
+      let data;
+
+      try {
+        data = await request.json();
+      } catch {
+        return respond({
+          ok: false,
+          error: "Invalid JSON"
+        }, 400);
+      }
+
+      const initData = data.initData;
+      const ymid = data.ymid;
+
+      if (
+        typeof initData !== "string" ||
+        initData.length === 0 ||
+        initData.length > 10000 ||
+        typeof ymid !== "string" ||
+        !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+      ) {
+        return respond({
+          ok: false,
+          error: "Invalid registration data"
+        }, 400);
+      }
+
+      try {
+        // Verify Telegram Mini App authentication.
+        const params = new URLSearchParams(initData);
+        const receivedHash = params.get("hash");
+        const authDate = Number(params.get("auth_date"));
+        const userJson = params.get("user");
+
+        if (
+          !receivedHash ||
+          !/^[a-f0-9]{64}$/i.test(receivedHash) ||
+          !Number.isSafeInteger(authDate) ||
+          !userJson
+        ) {
+          return respond({
+            ok: false,
+            error: "Invalid Telegram authentication data"
+          }, 401);
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+
+        if (
+          authDate > now + 60 ||
+          now - authDate > 86400
+        ) {
+          return respond({
+            ok: false,
+            error: "Telegram authentication has expired. Reopen the Mini App."
+          }, 401);
+        }
+
+        params.delete("hash");
+
+        const dataCheckString = [...params.entries()]
+          .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+          .map(([key, value]) => `${key}=${value}`)
+          .join("\n");
+
+        const encoder = new TextEncoder();
+
+        const secretKeyMaterial =
+          await crypto.subtle.importKey(
+            "raw",
+            encoder.encode("WebAppData"),
+            {
+              name: "HMAC",
+              hash: "SHA-256"
+            },
+            false,
+            ["sign"]
+          );
+
+        const secretKeyBytes =
+          await crypto.subtle.sign(
+            "HMAC",
+            secretKeyMaterial,
+            encoder.encode(env.TELEGRAM_BOT_TOKEN)
+          );
+
+        const secretKey =
+          await crypto.subtle.importKey(
+            "raw",
+            secretKeyBytes,
+            {
+              name: "HMAC",
+              hash: "SHA-256"
+            },
+            false,
+            ["sign"]
+          );
+
+        const calculatedHashBytes =
+          await crypto.subtle.sign(
+            "HMAC",
+            secretKey,
+            encoder.encode(dataCheckString)
+          );
+
+        const calculatedHash = Array.from(
+          new Uint8Array(calculatedHashBytes)
+        )
+          .map(byte => byte.toString(16).padStart(2, "0"))
+          .join("");
+
+        const normalizedHash = receivedHash.toLowerCase();
+
+        if (calculatedHash.length !== normalizedHash.length) {
+          return respond({
+            ok: false,
+            error: "Telegram authentication failed"
+          }, 401);
+        }
+
+        let difference = 0;
+
+        for (let i = 0; i < calculatedHash.length; i++) {
+          difference |=
+            calculatedHash.charCodeAt(i) ^
+            normalizedHash.charCodeAt(i);
+        }
+
+        if (difference !== 0) {
+          return respond({
+            ok: false,
+            error: "Telegram authentication failed"
+          }, 401);
+        }
+
+        let telegramUser;
+
+        try {
+          telegramUser = JSON.parse(userJson);
+        } catch {
+          return respond({
+            ok: false,
+            error: "Invalid Telegram user data"
+          }, 401);
+        }
+
+        const userId = String(telegramUser.id ?? "");
+
+        if (
+          !/^\d+$/.test(userId) ||
+          userId.length > 20
+        ) {
+          return respond({
+            ok: false,
+            error: "Invalid Telegram user ID"
+          }, 401);
+        }
+
+        // Do not overwrite an existing session ID.
+        const sessionKey = `monetag:session:${ymid}`;
+        const existing =
+          await env.RAPID_ADS_BALANCES.get(sessionKey);
+
+        if (existing) {
+          return respond({
+            ok: false,
+            error: "This advertisement session already exists"
+          }, 409);
+        }
+
+        const session = {
+          user_id: userId,
+          ymid: ymid,
+          created_at: new Date().toISOString(),
+          credited: false
+        };
+
+        await env.RAPID_ADS_BALANCES.put(
+          sessionKey,
+          JSON.stringify(session),
+          { expirationTtl: 7200 }
+        );
+
+        return respond({
+          ok: true,
+          registered: true,
+          message: "Advertisement session registered"
+        });
+
+      } catch (error) {
+        console.error("Monetag registration error:", error);
+
+        return respond({
+          ok: false,
+          error: "Could not register advertisement session"
+        }, 500);
+      }
+    }
     // ==========================================
     // 4. MONETAG POSTBACK — VERIFICATION ONLY
     // ==========================================
