@@ -8,5 +8,13 @@
 "binding": "RAPID_ADS_BALANCES",
 "id": "9335d0345de1406da1a65818138d320c"
 }
-]
+],
+"observability": {
+"logs": {
+"enabled": true,
+"head_sampling_rate": 1,
+"invocation_logs": true,
+"persist": true
+}
+}
 }
