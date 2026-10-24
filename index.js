@@ -663,10 +663,16 @@ export default {
           registered: true,
           message: "Advertisement session registered"
         });
-      } catch {
+      } catch (error) {
+        console.error(
+          "Monetag registration error:",
+          error
+        );
+
         return respond({
           ok: false,
-          error: "Could not register advertisement session"
+          error: "Could not register advertisement session",
+          details: String(error?.message || error)
         }, 500);
       }
     }
