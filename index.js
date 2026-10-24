@@ -563,11 +563,17 @@ export default {
 
       try {
         data = await request.json();
-      } catch {
+            } catch (error) {
+        console.error(
+          "Monetag registration error:",
+          error
+        );
+
         return respond({
           ok: false,
-          error: "Invalid JSON"
-        }, 400);
+          error: "Could not register advertisement session",
+          details: String(error?.message || error)
+        }, 500);
       }
 
       const initData = data.initData;
