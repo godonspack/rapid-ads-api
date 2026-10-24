@@ -545,6 +545,129 @@ export default {
         }, 500);
       }
       }
+        // ==========================================
+    // 4. REGISTER AUTHENTICATED MONETAG SESSION
+    // ==========================================
+    if (
+      url.pathname === "/monetag-register" &&
+      request.method === "POST"
+    ) {
+      if (!env.RAPID_ADS_BALANCES) {
+        return respond({
+          ok: false,
+          error: "Balance storage is not configured"
+        }, 503);
+      }
+
+      let data;
+
+      try {
+        data = await request.json();
+      } catch {
+        return respond({
+          ok: false,
+          error: "Invalid JSON"
+        }, 400);
+      }
+
+      const initData = data.initData;
+      const ymid = data.ymid;
+
+      if (
+        typeof initData !== "string" ||
+        initData.length === 0 ||
+        initData.length > 10000
+      ) {
+        return respond({
+          ok: false,
+          error: "Invalid Telegram authentication data"
+        }, 400);
+      }
+
+      if (
+        typeof ymid !== "string" ||
+        !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+      ) {
+        return respond({
+          ok: false,
+          error: "Invalid advertisement session ID"
+        }, 400);
+      }
+
+      try {
+        // Reuse the existing authenticated balance endpoint.
+        const authResponse = await fetch(
+          new URL("/balance", url.origin).toString(),
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              initData: initData
+            })
+          }
+        );
+
+        const authResult = await authResponse.json();
+
+        if (
+          !authResponse.ok ||
+          authResult.ok !== true ||
+          !authResult.user_id
+        ) {
+          return respond({
+            ok: false,
+            error: "Telegram authentication failed"
+          }, 401);
+        }
+
+        const userId = String(authResult.user_id);
+
+        // Never overwrite an existing session ID.
+        const sessionKey = `monetag:session:${ymid}`;
+
+        const existingSession =
+          await env.RAPID_ADS_BALANCES.get(sessionKey);
+
+        if (existingSession) {
+          return respond({
+            ok: false,
+            error: "Advertisement session ID already exists"
+          }, 409);
+        }
+
+        const session = {
+          user_id: userId,
+          ymid: ymid,
+          created_at: new Date().toISOString(),
+          credited: false
+        };
+
+        await env.RAPID_ADS_BALANCES.put(
+          sessionKey,
+          JSON.stringify(session),
+          {
+            expirationTtl: 7200
+          }
+        );
+
+        return respond({
+          ok: true,
+          registered: true,
+          message: "Advertisement session registered"
+        });
+      } catch {
+        return respond({
+          ok: false,
+          error: "Could not register advertisement session"
+        }, 500);
+      }
+    }
+
+    // ==========================================
+    // 5. HANDLE OTHER REQUESTS
+    // ==========================================
     // ==========================================
     // 4. HANDLE OTHER REQUESTS
     // ==========================================
