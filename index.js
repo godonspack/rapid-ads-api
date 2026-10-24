@@ -456,317 +456,156 @@ export default {
     // 4. MONETAG POSTBACK — VERIFICATION ONLY
     // ==========================================
     if (
-      url.pathname === "/monetag-postback" &&
-      request.method === "GET"
-    ) {
-      if (
-        !env.MONETAG_POSTBACK_SECRET ||
-        !env.RAPID_ADS_BALANCES
-      ) {
-        return respond({
-          ok: false,
-          error: "Server configuration incomplete"
-        }, 503);
-      }
+  url.pathname === "/monetag-postback" &&
+  request.method === "GET"
+) {
+  if (
+    !env.MONETAG_POSTBACK_SECRET ||
+    !env.RAPID_ADS_BALANCES
+  ) {
+    return respond({
+      ok: false,
+      error: "Server configuration incomplete"
+    }, 503);
+  }
 
-      const suppliedSecret = url.searchParams.get("secret");
+  // 1. Verify the private postback secret.
+  const suppliedSecret = url.searchParams.get("secret");
 
-      if (
-        !suppliedSecret ||
-        suppliedSecret !== env.MONETAG_POSTBACK_SECRET
-      ) {
-        return respond({
-          ok: false,
-          error: "Unauthorized"
-        }, 403);
-      }
+  if (
+    !suppliedSecret ||
+    suppliedSecret !== env.MONETAG_POSTBACK_SECRET
+  ) {
+    return respond({
+      ok: false,
+      error: "Unauthorized"
+    }, 403);
+  }
 
-      const ymid = url.searchParams.get("ymid");
-      const rewardType =
-        url.searchParams.get("reward_event_type");
-      const eventType =
-        url.searchParams.get("event_type");
-      const zoneId = url.searchParams.get("zone_id");
+  // 2. Read the notification details.
+  const ymid = url.searchParams.get("ymid");
+  const rewardType =
+    url.searchParams.get("reward_event_type");
+  const eventType =
+    url.searchParams.get("event_type");
+  const zoneId = url.searchParams.get("zone_id");
+  const telegramId =
+    url.searchParams.get("telegram_id");
+  const requestVar =
+    url.searchParams.get("request_var");
 
-      if (
-        !ymid ||
-        ymid.length > 200 ||
-        !/^[a-zA-Z0-9_-]+$/.test(ymid)
-      ) {
-        return respond({
-          ok: false,
-          error: "Invalid ymid"
-        }, 400);
-      }
+  // 3. Validate the session ID.
+  if (
+    !ymid ||
+    ymid.length > 200 ||
+    !/^[a-zA-Z0-9_-]+$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid ymid"
+    }, 400);
+  }
 
-      // This endpoint only records notifications.
-      // It does NOT credit any user balance.
-      const eventKey = `monetag:test:${ymid}`;
+  // 4. Accept only the expected ad zone and values.
+  if (
+    zoneId !== "12109194" ||
+    !["valued", "non_valued"].includes(rewardType) ||
+    !["impression", "click"].includes(eventType) ||
+    requestVar !== "rapid_ads_watch"
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid postback parameters"
+    }, 400);
+  }
 
-      try {
-        const existing =
-          await env.RAPID_ADS_BALANCES.get(eventKey);
+  try {
+    // 5. Find the session created by the Mini App.
+    const sessionKey = `monetag:session:${ymid}`;
+    const sessionText =
+      await env.RAPID_ADS_BALANCES.get(sessionKey);
 
-        if (existing) {
-          return respond({
-            ok: true,
-            duplicate: true,
-            message: "Notification already recorded"
-          });
-        }
+    if (!sessionText) {
+      return respond({
+        ok: false,
+        error: "Advertisement session not found or expired"
+      }, 404);
+    }
 
-        const record = {
-          ymid: ymid,
-          event_type: eventType,
-          reward_event_type: rewardType,
-          zone_id: zoneId,
-          received_at: new Date().toISOString(),
-          reward_eligible: rewardType === "valued",
-          credited: false
-        };
+    let session;
 
-        await env.RAPID_ADS_BALANCES.put(
-          eventKey,
-          JSON.stringify(record)
-        );
+    try {
+      session = JSON.parse(sessionText);
+    } catch {
+      return respond({
+        ok: false,
+        error: "Invalid stored session"
+      }, 500);
+    }
 
-        return respond({
-          ok: true,
-          recorded: true,
-          reward_eligible: rewardType === "valued",
-          credited: false,
-          message:
-            "Postback recorded for testing; no reward credited"
-        });
-      } catch {
-        return respond({
-          ok: false,
-          error: "Could not record notification"
-        }, 500);
-      }
-      }
-        // ==========================================
-    // 4. REGISTER AUTHENTICATED MONETAG SESSION
-    // ==========================================
+    // 6. Confirm the notification belongs to this session.
     if (
-      url.pathname === "/monetag-register" &&
-      request.method === "POST"
+      !session.user_id ||
+      String(session.user_id) !== String(telegramId) ||
+      String(session.ymid) !== String(ymid)
     ) {
-      if (!env.RAPID_ADS_BALANCES) {
-        return respond({
-          ok: false,
-          error: "Balance storage is not configured"
-        }, 503);
-      }
+      return respond({
+        ok: false,
+        error: "Session user verification failed"
+      }, 403);
+    }
 
-      let data;
+    // 7. Record the event separately by event and reward type.
+    // This allows a non-valued event to arrive before a valued event.
+    const eventKey =
+      `monetag:event:${ymid}:${eventType}:${rewardType}`;
 
-      try {
-        data = await request.json();
-            } catch (error) {
-        console.error(
-          "Monetag registration error:",
-          error
-        );
+    const existing =
+      await env.RAPID_ADS_BALANCES.get(eventKey);
 
-        return respond({
-          ok: false,
-          error: "Could not register advertisement session",
-          details: String(error?.message || error)
-        }, 500);
-      }
+    if (existing) {
+      return respond({
+        ok: true,
+        duplicate: true,
+        credited: false,
+        message: "This notification was already recorded"
+      });
+    }
 
-      const initData = data.initData;
-      const ymid = data.ymid;
+    const record = {
+      ymid: ymid,
+      user_id: String(session.user_id),
+      event_type: eventType,
+      reward_event_type: rewardType,
+      zone_id: zoneId,
+      request_var: requestVar,
+      received_at: new Date().toISOString(),
+      reward_eligible: rewardType === "valued",
+      credited: false
+    };
 
-      if (
-        typeof initData !== "string" ||
-        initData.length === 0 ||
-        initData.length > 10000
-      ) {
-        return respond({
-          ok: false,
-          error: "Invalid Telegram authentication data"
-        }, 400);
-      }
+    await env.RAPID_ADS_BALANCES.put(
+      eventKey,
+      JSON.stringify(record),
+      { expirationTtl: 604800 }
+    );
 
-      if (
-        typeof ymid !== "string" ||
-        !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
-      ) {
-        return respond({
-          ok: false,
-          error: "Invalid advertisement session ID"
-        }, 400);
-      }
+    return respond({
+      ok: true,
+      recorded: true,
+      reward_eligible: rewardType === "valued",
+      credited: false,
+      message: "Verified Monetag notification recorded; no reward credited"
+    });
 
-      try {
-        // Verify Telegram Mini App authentication directly.
-        const params = new URLSearchParams(initData);
+  } catch (error) {
+    console.error("Monetag postback processing failed:", error);
 
-        const receivedHash = params.get("hash");
-        const authDate = Number(params.get("auth_date"));
-        const userJson = params.get("user");
-
-        if (
-          !receivedHash ||
-          !/^[a-f0-9]{64}$/i.test(receivedHash) ||
-          !Number.isSafeInteger(authDate) ||
-          !userJson
-        ) {
-          return respond({
-            ok: false,
-            error: "Invalid Telegram authentication data"
-          }, 401);
-        }
-
-        const now = Math.floor(Date.now() / 1000);
-
-        if (
-          authDate > now + 60 ||
-          now - authDate > 86400
-        ) {
-          return respond({
-            ok: false,
-            error: "Telegram authentication has expired"
-          }, 401);
-        }
-
-        params.delete("hash");
-
-        const dataCheckString = [...params.entries()]
-          .sort(([a], [b]) => {
-            if (a < b) return -1;
-            if (a > b) return 1;
-            return 0;
-          })
-          .map(([key, value]) => `${key}=${value}`)
-          .join("\n");
-
-        const encoder = new TextEncoder();
-
-        const secretKeyMaterial = await crypto.subtle.importKey(
-          "raw",
-          encoder.encode("WebAppData"),
-          {
-            name: "HMAC",
-            hash: "SHA-256"
-          },
-          false,
-          ["sign"]
-        );
-
-        const secretKeyBytes = await crypto.subtle.sign(
-          "HMAC",
-          secretKeyMaterial,
-          encoder.encode(env.TELEGRAM_BOT_TOKEN)
-        );
-
-        const secretKey = await crypto.subtle.importKey(
-          "raw",
-          secretKeyBytes,
-          {
-            name: "HMAC",
-            hash: "SHA-256"
-          },
-          false,
-          ["sign"]
-        );
-
-        const calculatedHashBytes = await crypto.subtle.sign(
-          "HMAC",
-          secretKey,
-          encoder.encode(dataCheckString)
-        );
-
-        const calculatedHash = Array.from(
-          new Uint8Array(calculatedHashBytes)
-        )
-          .map(byte => byte.toString(16).padStart(2, "0"))
-          .join("");
-
-        const normalizedHash = receivedHash.toLowerCase();
-
-        let difference = 0;
-
-        for (let i = 0; i < calculatedHash.length; i++) {
-          difference |=
-            calculatedHash.charCodeAt(i) ^
-            normalizedHash.charCodeAt(i);
-        }
-
-        if (difference !== 0) {
-          return respond({
-            ok: false,
-            error: "Telegram authentication failed"
-          }, 401);
-        }
-
-        let telegramUser;
-
-        try {
-          telegramUser = JSON.parse(userJson);
-        } catch {
-          return respond({
-            ok: false,
-            error: "Invalid Telegram user data"
-          }, 401);
-        }
-
-        const userId = String(telegramUser.id ?? "");
-
-        if (!/^\d+$/.test(userId) || userId.length > 20) {
-          return respond({
-            ok: false,
-            error: "Invalid Telegram user ID"
-          }, 401);
-        }
-
-        // Never overwrite an existing session ID.
-        const sessionKey = `monetag:session:${ymid}`;
-
-        const existingSession =
-          await env.RAPID_ADS_BALANCES.get(sessionKey);
-
-        if (existingSession) {
-          return respond({
-            ok: false,
-            error: "Advertisement session ID already exists"
-          }, 409);
-        }
-
-        const session = {
-          user_id: userId,
-          ymid: ymid,
-          created_at: new Date().toISOString(),
-          credited: false
-        };
-
-        await env.RAPID_ADS_BALANCES.put(
-          sessionKey,
-          JSON.stringify(session),
-          {
-            expirationTtl: 7200
-          }
-        );
-
-        return respond({
-          ok: true,
-          registered: true,
-          message: "Advertisement session registered"
-        });
-      } catch (error) {
-        console.error(
-          "Monetag registration error:",
-          error
-        );
-
-        return respond({
-          ok: false,
-          error: "Could not register advertisement session",
-          details: String(error?.message || error)
-        }, 500);
-      }
+    return respond({
+      ok: false,
+      error: "Could not process notification"
+    }, 500);
+  }
     }
 
     // ==========================================
