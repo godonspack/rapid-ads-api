@@ -452,7 +452,99 @@ export default {
         }, 500);
       }
     }
+    // ==========================================
+    // 4. MONETAG POSTBACK — VERIFICATION ONLY
+    // ==========================================
+    if (
+      url.pathname === "/monetag-postback" &&
+      request.method === "GET"
+    ) {
+      if (
+        !env.MONETAG_POSTBACK_SECRET ||
+        !env.RAPID_ADS_BALANCES
+      ) {
+        return respond({
+          ok: false,
+          error: "Server configuration incomplete"
+        }, 503);
+      }
 
+      const suppliedSecret = url.searchParams.get("secret");
+
+      if (
+        !suppliedSecret ||
+        suppliedSecret !== env.MONETAG_POSTBACK_SECRET
+      ) {
+        return respond({
+          ok: false,
+          error: "Unauthorized"
+        }, 403);
+      }
+
+      const ymid = url.searchParams.get("ymid");
+      const rewardType =
+        url.searchParams.get("reward_event_type");
+      const eventType =
+        url.searchParams.get("event_type");
+      const zoneId = url.searchParams.get("zone_id");
+
+      if (
+        !ymid ||
+        ymid.length > 200 ||
+        !/^[a-zA-Z0-9_-]+$/.test(ymid)
+      ) {
+        return respond({
+          ok: false,
+          error: "Invalid ymid"
+        }, 400);
+      }
+
+      // This endpoint only records notifications.
+      // It does NOT credit any user balance.
+      const eventKey = `monetag:test:${ymid}`;
+
+      try {
+        const existing =
+          await env.RAPID_ADS_BALANCES.get(eventKey);
+
+        if (existing) {
+          return respond({
+            ok: true,
+            duplicate: true,
+            message: "Notification already recorded"
+          });
+        }
+
+        const record = {
+          ymid: ymid,
+          event_type: eventType,
+          reward_event_type: rewardType,
+          zone_id: zoneId,
+          received_at: new Date().toISOString(),
+          reward_eligible: rewardType === "valued",
+          credited: false
+        };
+
+        await env.RAPID_ADS_BALANCES.put(
+          eventKey,
+          JSON.stringify(record)
+        );
+
+        return respond({
+          ok: true,
+          recorded: true,
+          reward_eligible: rewardType === "valued",
+          credited: false,
+          message:
+            "Postback recorded for testing; no reward credited"
+        });
+      } catch {
+        return respond({
+          ok: false,
+          error: "Could not record notification"
+        }, 500);
+      }
+      }
     // ==========================================
     // 4. HANDLE OTHER REQUESTS
     // ==========================================
