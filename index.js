@@ -1061,10 +1061,11 @@ error: "Method not allowed"
   );
 
   if (!result) {
-    return respond({
-      ok: false,
-      error: "No saved result found"
-    }, 404);
+return respond({
+ok: false,
+error: "No saved result found",
+request_id: requestId
+}, 200);
   }
 
   return respond({
