@@ -840,7 +840,7 @@ const authorization = request.headers.get("Authorization");
 
 if (
 !env.TBC_API_SECRET ||
-authorization !== "Bearer ${env.TBC_API_SECRET}"
+authorization !== `Bearer ${env.TBC_API_SECRET}`
 ) {
 return respond({
 ok: false,
