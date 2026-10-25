@@ -822,6 +822,110 @@ export default {
     }, 500);
   }
     }
+    // ==========================================
+// TBC BALANCE RESULT CALLBACK — READ ONLY
+// ==========================================
+if (
+  url.pathname === "/tbc-balance-result" &&
+  request.method === "POST"
+) {
+  if (
+    !env.TBC_API_SECRET ||
+    !env.RAPID_ADS_BALANCES
+  ) {
+    return respond({
+      ok: false,
+      error: "Server configuration incomplete"
+    }, 503);
+  }
+
+  const authorization =
+    request.headers.get("Authorization");
+
+  if (
+    authorization !== `Bearer ${env.TBC_API_SECRET}`
+  ) {
+    return respond({
+      ok: false,
+      error: "Unauthorized"
+    }, 401);
+  }
+
+  let data;
+
+  try {
+    data = await request.json();
+  } catch {
+    return respond({
+      ok: false,
+      error: "Invalid JSON"
+    }, 400);
+  }
+
+  const requestId = String(data.request_id || "");
+  const userId = String(data.user_id || "");
+  const balance = data.balance;
+
+  if (
+    !/^[a-zA-Z0-9_-]{16,100}$/.test(requestId) ||
+    !/^\d{1,20}$/.test(userId) ||
+    typeof balance !== "number" ||
+    !Number.isFinite(balance) ||
+    balance < 0 ||
+    balance > 1000000000
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid balance result"
+    }, 400);
+  }
+
+  const resultKey =
+    `balance-result:${requestId}`;
+
+  try {
+    const existing =
+      await env.RAPID_ADS_BALANCES.get(resultKey);
+
+    if (existing) {
+      return respond({
+        ok: false,
+        error: "Request already has a result"
+      }, 409);
+    }
+
+    const result = {
+      request_id: requestId,
+      user_id: userId,
+      balance: Number(balance.toFixed(8)),
+      received_at: new Date().toISOString(),
+      read_only: true
+    };
+
+    await env.RAPID_ADS_BALANCES.put(
+      resultKey,
+      JSON.stringify(result),
+      { expirationTtl: 300 }
+    );
+
+    return respond({
+      ok: true,
+      received: true,
+      read_only: true
+    });
+
+  } catch (error) {
+    console.error(
+      "TBC balance callback failed:",
+      error
+    );
+
+    return respond({
+      ok: false,
+      error: "Could not save balance result"
+    }, 500);
+  }
+      }
 // ==========================================
 // TEST: SEND JSON TO TELEBOT CREATOR
 // ==========================================
