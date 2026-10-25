@@ -1020,6 +1020,62 @@ return respond({
     // ==========================================
     // 4. HANDLE OTHER REQUESTS
     // ==========================================
+    // ==========================================
+// TBC BALANCE RESULT CHECK — PROTECTED TEST
+// ==========================================
+if (url.pathname === "/tbc-balance-result-check") {
+if (request.method !== "POST") {
+return respond({
+ok: false,
+error: "Method not allowed"
+}, 405);
+}
+
+  if (
+    !env.TBC_API_SECRET ||
+    request.headers.get("Authorization") !==
+      "Bearer " + env.TBC_API_SECRET
+  ) {
+    return respond({
+      ok: false,
+      error: "Unauthorized"
+    }, 401);
+  }
+
+  const body = await request.json();
+  const requestId = body.request_id;
+
+  if (
+    typeof requestId !== "string" ||
+    !/^[a-zA-Z0-9_-]{16,100}$/.test(requestId)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid request_id"
+    }, 400);
+  }
+
+  const result = await env.RAPID_ADS_BALANCES.get(
+    "balance-result:" + requestId,
+    "json"
+  );
+
+  if (!result) {
+    return respond({
+      ok: false,
+      error: "No saved result found"
+    }, 404);
+  }
+
+  return respond({
+    ok: true,
+    result: result
+  });
+}
+
+// ==========================================
+// END PROTECTED BALANCE RESULT CHECK
+// ==========================================
     if (request.method !== "GET") {
       return respond({
         ok: false,
