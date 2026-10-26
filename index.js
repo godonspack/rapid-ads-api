@@ -1300,7 +1300,192 @@ request_id: requestId
     result: result
   });
 }
+// ==========================================
+// SECURE MINI APP BALANCE RESULT CHECK
+// ==========================================
+if (
+  url.pathname === "/balance-result" &&
+  request.method === "POST"
+) {
+  if (
+    !env.TELEGRAM_BOT_TOKEN ||
+    !env.RAPID_ADS_BALANCES
+  ) {
+    return respond({
+      ok: false,
+      error: "Server configuration incomplete"
+    }, 503);
+  }
 
+  let data;
+
+  try {
+    data = await request.json();
+  } catch {
+    return respond({
+      ok: false,
+      error: "Invalid JSON"
+    }, 400);
+  }
+
+  const initData = data.initData;
+  const requestId = String(data.request_id || "");
+
+  if (
+    typeof initData !== "string" ||
+    !initData ||
+    initData.length > 10000 ||
+    !/^[a-zA-Z0-9_-]{16,100}$/.test(requestId)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid request"
+    }, 400);
+  }
+
+  try {
+    const params = new URLSearchParams(initData);
+    const receivedHash = params.get("hash");
+    const authDate = Number(params.get("auth_date"));
+    const userJson = params.get("user");
+
+    if (
+      !receivedHash ||
+      !/^[a-f0-9]{64}$/i.test(receivedHash) ||
+      !Number.isSafeInteger(authDate) ||
+      !userJson
+    ) {
+      return respond({
+        ok: false,
+        error: "Invalid Telegram authentication"
+      }, 401);
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+
+    if (authDate > now + 60 || now - authDate > 86400) {
+      return respond({
+        ok: false,
+        error: "Telegram authentication expired"
+      }, 401);
+    }
+
+    params.delete("hash");
+
+    const dataCheckString = [...params.entries()]
+      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n");
+
+    const encoder = new TextEncoder();
+
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode("WebAppData"),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+
+    const secretBytes = await crypto.subtle.sign(
+      "HMAC",
+      keyMaterial,
+      encoder.encode(env.TELEGRAM_BOT_TOKEN)
+    );
+
+    const secretKey = await crypto.subtle.importKey(
+      "raw",
+      secretBytes,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+
+    const hashBytes = await crypto.subtle.sign(
+      "HMAC",
+      secretKey,
+      encoder.encode(dataCheckString)
+    );
+
+    const calculatedHash = Array.from(new Uint8Array(hashBytes))
+      .map(byte => byte.toString(16).padStart(2, "0"))
+      .join("");
+
+    const expectedHash = receivedHash.toLowerCase();
+    let difference = 0;
+
+    for (let i = 0; i < calculatedHash.length; i++) {
+      difference |=
+        calculatedHash.charCodeAt(i) ^
+        expectedHash.charCodeAt(i);
+    }
+
+    if (difference !== 0) {
+      return respond({
+        ok: false,
+        error: "Telegram authentication failed"
+      }, 401);
+    }
+
+    let telegramUser;
+
+    try {
+      telegramUser = JSON.parse(userJson);
+    } catch {
+      return respond({
+        ok: false,
+        error: "Invalid Telegram user data"
+      }, 401);
+    }
+
+    const userId = String(telegramUser.id ?? "");
+
+    if (!/^\d{1,20}$/.test(userId)) {
+      return respond({
+        ok: false,
+        error: "Invalid Telegram user ID"
+      }, 401);
+    }
+
+    const result = await env.RAPID_ADS_BALANCES.get(
+      `balance-result:${requestId}`,
+      "json"
+    );
+
+    if (!result) {
+      return respond({
+        ok: true,
+        ready: false,
+        message: "Balance result is not available yet"
+      });
+    }
+
+    if (String(result.user_id) !== userId) {
+      return respond({
+        ok: false,
+        error: "This result does not belong to your account"
+      }, 403);
+    }
+
+    return respond({
+      ok: true,
+      ready: true,
+      user_id: userId,
+      balance: result.balance,
+      read_only: true
+    });
+  } catch (error) {
+    console.error("Balance result check failed:", error);
+
+    return respond({
+      ok: false,
+      error: "Could not check balance result"
+    }, 500);
+  }
+}
+// ==========================================
+// END SECURE MINI APP BALANCE RESULT CHECK
+// ==========================================
 // ==========================================
 // END PROTECTED BALANCE RESULT CHECK
 // ==========================================
