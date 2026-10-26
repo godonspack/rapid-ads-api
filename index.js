@@ -86,7 +86,216 @@ export default {
         telegramBot
       });
     }
+// ==========================================
+// REQUEST LIVE TBC BALANCE
+// ==========================================
+if (
+  url.pathname === "/balance-request" &&
+  request.method === "POST"
+) {
+  if (
+    !env.TELEGRAM_BOT_TOKEN ||
+    !env.TBC_TEST_WEBHOOK_URL ||
+    !env.RAPID_ADS_BALANCES
+  ) {
+    return respond({
+      ok: false,
+      error: "Server configuration incomplete"
+    }, 503);
+  }
 
+  let data;
+
+  try {
+    data = await request.json();
+  } catch {
+    return respond({
+      ok: false,
+      error: "Invalid JSON"
+    }, 400);
+  }
+
+  const initData = data.initData;
+
+  if (
+    typeof initData !== "string" ||
+    initData.length === 0 ||
+    initData.length > 10000
+  ) {
+    return respond({
+      ok: false,
+      error: "Missing Telegram authentication data"
+    }, 400);
+  }
+
+  try {
+    const params = new URLSearchParams(initData);
+    const receivedHash = params.get("hash");
+    const authDate = Number(params.get("auth_date"));
+    const userJson = params.get("user");
+
+    if (
+      !receivedHash ||
+      !/^[a-f0-9]{64}$/i.test(receivedHash) ||
+      !Number.isSafeInteger(authDate) ||
+      !userJson
+    ) {
+      return respond({
+        ok: false,
+        error: "Invalid Telegram authentication data"
+      }, 401);
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+
+    if (
+      authDate > now + 60 ||
+      now - authDate > 86400
+    ) {
+      return respond({
+        ok: false,
+        error: "Telegram authentication has expired"
+      }, 401);
+    }
+
+    params.delete("hash");
+
+    const dataCheckString = [...params.entries()]
+      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n");
+
+    const encoder = new TextEncoder();
+
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode("WebAppData"),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+
+    const secretBytes = await crypto.subtle.sign(
+      "HMAC",
+      keyMaterial,
+      encoder.encode(env.TELEGRAM_BOT_TOKEN)
+    );
+
+    const secretKey = await crypto.subtle.importKey(
+      "raw",
+      secretBytes,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+
+    const hashBytes = await crypto.subtle.sign(
+      "HMAC",
+      secretKey,
+      encoder.encode(dataCheckString)
+    );
+
+    const calculatedHash = Array.from(new Uint8Array(hashBytes))
+      .map(byte => byte.toString(16).padStart(2, "0"))
+      .join("");
+
+    const expectedHash = receivedHash.toLowerCase();
+
+    let difference = 0;
+
+    for (let i = 0; i < calculatedHash.length; i++) {
+      difference |=
+        calculatedHash.charCodeAt(i) ^
+        expectedHash.charCodeAt(i);
+    }
+
+    if (difference !== 0) {
+      return respond({
+        ok: false,
+        error: "Telegram authentication failed"
+      }, 401);
+    }
+
+    let telegramUser;
+
+    try {
+      telegramUser = JSON.parse(userJson);
+    } catch {
+      return respond({
+        ok: false,
+        error: "Invalid Telegram user data"
+      }, 401);
+    }
+
+    const userId = String(telegramUser.id ?? "");
+
+    if (!/^\d{1,20}$/.test(userId)) {
+      return respond({
+        ok: false,
+        error: "Invalid Telegram user ID"
+      }, 401);
+    }
+
+    const requestId = crypto.randomUUID();
+    const pendingKey = `pending-balance:${requestId}`;
+    const expiresAt = Date.now() + 120000;
+
+    await env.RAPID_ADS_BALANCES.put(
+      pendingKey,
+      JSON.stringify({
+        request_id: requestId,
+        user_id: userId,
+        expires_at: expiresAt
+      }),
+      { expirationTtl: 120 }
+    );
+
+    let webhookResponse;
+
+    try {
+      webhookResponse = await fetch(
+        env.TBC_TEST_WEBHOOK_URL,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            request_id: requestId,
+            user_id: userId
+          })
+        }
+      );
+    } catch (error) {
+      await env.RAPID_ADS_BALANCES.delete(pendingKey);
+      throw error;
+    }
+
+    if (!webhookResponse.ok) {
+      await env.RAPID_ADS_BALANCES.delete(pendingKey);
+
+      return respond({
+        ok: false,
+        error: "Telebot Creator request failed",
+        upstream_status: webhookResponse.status
+      }, 502);
+    }
+
+    return respond({
+      ok: true,
+      request_id: requestId,
+      expires_in_seconds: 120,
+      message: "Balance request sent"
+    });
+  } catch (error) {
+    console.error("Balance request failed:", error);
+
+    return respond({
+      ok: false,
+      error: "Could not start balance request"
+    }, 500);
+  }
+        }
     // ==========================================
     // 2. GET BALANCE FOR AUTHENTICATED MINI APP
     // ==========================================
