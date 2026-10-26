@@ -839,11 +839,9 @@ if (
     }, 503);
   }
 
-  const authorization =
-    request.headers.get("Authorization");
-
   if (
-    authorization !== `Bearer ${env.TBC_API_SECRET}`
+    request.headers.get("Authorization") !==
+    `Bearer ${env.TBC_API_SECRET}`
   ) {
     return respond({
       ok: false,
@@ -880,10 +878,29 @@ if (
     }, 400);
   }
 
-  const resultKey =
-    `balance-result:${requestId}`;
+  const pendingKey = `pending-balance:${requestId}`;
+  const resultKey = `balance-result:${requestId}`;
 
   try {
+    const pending =
+      await env.RAPID_ADS_BALANCES.get(
+        pendingKey,
+        "json"
+      );
+
+    if (
+      !pending ||
+      String(pending.user_id) !== userId ||
+      pending.request_id !== requestId ||
+      typeof pending.expires_at !== "number" ||
+      pending.expires_at <= Date.now()
+    ) {
+      return respond({
+        ok: false,
+        error: "No matching valid pending request"
+      }, 403);
+    }
+
     const existing =
       await env.RAPID_ADS_BALANCES.get(resultKey);
 
@@ -908,12 +925,13 @@ if (
       { expirationTtl: 300 }
     );
 
+    await env.RAPID_ADS_BALANCES.delete(pendingKey);
+
     return respond({
       ok: true,
       received: true,
       read_only: true
     });
-
   } catch (error) {
     console.error(
       "TBC balance callback failed:",
@@ -922,7 +940,7 @@ if (
 
     return respond({
       ok: false,
-      error: "Could not save balance result"
+      error: "Could not validate or save balance result"
     }, 500);
   }
       }
