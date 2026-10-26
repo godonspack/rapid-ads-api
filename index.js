@@ -1489,6 +1489,110 @@ if (
 // ==========================================
 // END PROTECTED BALANCE RESULT CHECK
 // ==========================================
+   // ==========================================
+// TEMPORARY MONETAG EVENT CHECK — READ ONLY
+// ==========================================
+if (
+  url.pathname === "/monetag-check" &&
+  request.method === "POST"
+) {
+  if (
+    !env.TBC_API_SECRET ||
+    !env.RAPID_ADS_BALANCES
+  ) {
+    return respond({
+      ok: false,
+      error: "Server configuration incomplete"
+    }, 503);
+  }
+
+  if (
+    request.headers.get("Authorization") !==
+    "Bearer " + env.TBC_API_SECRET
+  ) {
+    return respond({
+      ok: false,
+      error: "Unauthorized"
+    }, 401);
+  }
+
+  let data;
+
+  try {
+    data = await request.json();
+  } catch {
+    return respond({
+      ok: false,
+      error: "Invalid JSON"
+    }, 400);
+  }
+
+  const ymid = String(data.ymid || "");
+
+  if (!/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)) {
+    return respond({
+      ok: false,
+      error: "Invalid ymid"
+    }, 400);
+  }
+
+  try {
+    const session = await env.RAPID_ADS_BALANCES.get(
+      "monetag:session:" + ymid,
+      "json"
+    );
+
+    const events = [];
+
+    for (const eventType of ["impression", "click"]) {
+      for (const rewardType of ["valued", "non_valued"]) {
+        const key =
+          "monetag:event:" +
+          ymid + ":" +
+          eventType + ":" +
+          rewardType;
+
+        const record =
+          await env.RAPID_ADS_BALANCES.get(key, "json");
+
+        if (record) {
+          events.push({
+            event_type: record.event_type,
+            reward_event_type: record.reward_event_type,
+            reward_eligible: record.reward_eligible,
+            credited: record.credited,
+            received_at: record.received_at
+          });
+        }
+      }
+    }
+
+    return respond({
+      ok: true,
+      ymid: ymid,
+      session_found: Boolean(session),
+      session_user_matches_events: session
+        ? events.every(
+            event => true
+          )
+        : false,
+      event_count: events.length,
+      events: events,
+      read_only: true,
+      message: "Diagnostic completed. No balance changed."
+    });
+  } catch (error) {
+    console.error("Monetag diagnostic failed:", error);
+
+    return respond({
+      ok: false,
+      error: "Could not read Monetag diagnostic records"
+    }, 500);
+  }
+}
+// ==========================================
+// END TEMPORARY MONETAG EVENT CHECK
+// ==========================================
     if (request.method !== "GET") {
       return respond({
         ok: false,
