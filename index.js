@@ -1975,21 +1975,14 @@ if (
   url.pathname === "/monetag-cooldown-start" &&
   request.method === "POST"
 ) {
-  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
+  if (
+    !env.TELEGRAM_BOT_TOKEN ||
+    !env.MONETAG_REWARD_COORDINATOR
+  ) {
     return respond({
       ok: false,
       error: "Required API configuration is missing"
     }, 503);
-  }
-
-  if (
-    request.headers.get("Authorization") !==
-    "Bearer " + env.TBC_API_SECRET
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized"
-    }, 401);
   }
 
   let data;
@@ -2003,16 +1996,151 @@ if (
     }, 400);
   }
 
-  const userId = String(data.user_id || "");
+  const initData = data.initData;
 
-  if (!/^\d{1,25}$/.test(userId)) {
+  if (
+    typeof initData !== "string" ||
+    initData.length === 0 ||
+    initData.length > 10000
+  ) {
     return respond({
       ok: false,
-      error: "Invalid user ID"
-    }, 400);
+      error: "Invalid Telegram authentication data"
+    }, 401);
   }
 
   try {
+    const params = new URLSearchParams(initData);
+    const receivedHash = params.get("hash");
+    const authDate = Number(params.get("auth_date"));
+    const userJson = params.get("user");
+
+    if (
+      !receivedHash ||
+      !/^[a-f0-9]{64}$/i.test(receivedHash) ||
+      !Number.isSafeInteger(authDate) ||
+      !userJson
+    ) {
+      return respond({
+        ok: false,
+        error: "Invalid Telegram authentication data"
+      }, 401);
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+
+    if (
+      authDate > now + 60 ||
+      now - authDate > 86400
+    ) {
+      return respond({
+        ok: false,
+        error: "Telegram authentication has expired. Reopen the Mini App."
+      }, 401);
+    }
+
+    params.delete("hash");
+
+    const dataCheckString = [...params.entries()]
+      .sort(([a], [b]) =>
+        a < b ? -1 : a > b ? 1 : 0
+      )
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n");
+
+    const encoder = new TextEncoder();
+
+    const secretKeyMaterial =
+      await crypto.subtle.importKey(
+        "raw",
+        encoder.encode("WebAppData"),
+        {
+          name: "HMAC",
+          hash: "SHA-256"
+        },
+        false,
+        ["sign"]
+      );
+
+    const secretKeyBytes =
+      await crypto.subtle.sign(
+        "HMAC",
+        secretKeyMaterial,
+        encoder.encode(env.TELEGRAM_BOT_TOKEN)
+      );
+
+    const secretKey =
+      await crypto.subtle.importKey(
+        "raw",
+        secretKeyBytes,
+        {
+          name: "HMAC",
+          hash: "SHA-256"
+        },
+        false,
+        ["sign"]
+      );
+
+    const calculatedHashBytes =
+      await crypto.subtle.sign(
+        "HMAC",
+        secretKey,
+        encoder.encode(dataCheckString)
+      );
+
+    const calculatedHash = Array.from(
+      new Uint8Array(calculatedHashBytes)
+    )
+      .map(byte => byte.toString(16).padStart(2, "0"))
+      .join("");
+
+    const normalizedHash = receivedHash.toLowerCase();
+
+    if (calculatedHash.length !== normalizedHash.length) {
+      return respond({
+        ok: false,
+        error: "Telegram authentication failed"
+      }, 401);
+    }
+
+    let difference = 0;
+
+    for (let i = 0; i < calculatedHash.length; i++) {
+      difference |=
+        calculatedHash.charCodeAt(i) ^
+        normalizedHash.charCodeAt(i);
+    }
+
+    if (difference !== 0) {
+      return respond({
+        ok: false,
+        error: "Telegram authentication failed"
+      }, 401);
+    }
+
+    let telegramUser;
+
+    try {
+      telegramUser = JSON.parse(userJson);
+    } catch {
+      return respond({
+        ok: false,
+        error: "Invalid Telegram user data"
+      }, 401);
+    }
+
+    const userId = String(telegramUser.id ?? "");
+
+    if (
+      !/^\d+$/.test(userId) ||
+      userId.length > 20
+    ) {
+      return respond({
+        ok: false,
+        error: "Invalid Telegram user ID"
+      }, 401);
+    }
+
     const coordinatorId =
       env.MONETAG_REWARD_COORDINATOR.idFromName(
         "cooldown:" + userId
@@ -2041,7 +2169,7 @@ if (
       ok: coordinatorResponse.ok && result.ok === true,
       coordinator_http_status: coordinatorResponse.status,
       result: result,
-      message: "Cooldown enforcement completed. No reward was credited."
+      message: "Cooldown check completed. No reward was credited."
     }, coordinatorResponse.ok ? 200 : 502);
 
   } catch (error) {
@@ -2052,7 +2180,7 @@ if (
       error: "Cooldown enforcement failed"
     }, 500);
   }
-    }
+      }
 // ==========================================
 // END MONETAG COOLDOWN CHECK
 // ==========================================
