@@ -1557,12 +1557,13 @@ if (
 
         if (record) {
           events.push({
-            event_type: record.event_type,
-            reward_event_type: record.reward_event_type,
-            reward_eligible: record.reward_eligible,
-            credited: record.credited,
-            received_at: record.received_at
-          });
+  user_id: String(record.user_id || ""),
+  event_type: record.event_type,
+  reward_event_type: record.reward_event_type,
+  reward_eligible: record.reward_eligible,
+  credited: record.credited,
+  received_at: record.received_at
+});
         }
       }
     }
@@ -1572,10 +1573,10 @@ if (
       ymid: ymid,
       session_found: Boolean(session),
       session_user_matches_events: session
-        ? events.every(
-            event => true
-          )
-        : false,
+  ? events.every(
+      event => String(event.user_id) === String(session.user_id)
+    )
+  : false,
       event_count: events.length,
       events: events,
       read_only: true,
