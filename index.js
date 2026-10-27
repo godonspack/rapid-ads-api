@@ -1701,3 +1701,79 @@ if (
     });
   }
 };
+// ==========================================
+// MONETAG REWARD COORDINATOR
+// READ-ONLY TEST VERSION
+// ==========================================
+export class MonetagRewardCoordinator {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    if (request.method !== "POST") {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "Method not allowed"
+        }),
+        {
+          status: 405,
+          headers: {
+            "Content-Type": "application/json"
+          }
+        }
+      );
+    }
+
+    let data;
+
+    try {
+      data = await request.json();
+    } catch {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "Invalid JSON"
+        }),
+        {
+          status: 400,
+          headers: {
+            "Content-Type": "application/json"
+          }
+        }
+      );
+    }
+
+    if (data.action !== "health_check") {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "Only health checks are enabled"
+        }),
+        {
+          status: 400,
+          headers: {
+            "Content-Type": "application/json"
+          }
+        }
+      );
+    }
+
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        coordinator: "MonetagRewardCoordinator",
+        mode: "read_only",
+        message: "Coordinator is running. No rewards were credited."
+      }),
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json"
+        }
+      }
+    );
+  }
+}
