@@ -1686,6 +1686,109 @@ if (
 // ==========================================
 // END TEMPORARY MONETAG EVENT CHECK
 // ==========================================
+    // ==========================================
+// MONETAG COORDINATOR HEALTH CHECK — READ ONLY
+// ==========================================
+if (
+  url.pathname === "/monetag-coordinator-health" &&
+  request.method === "POST"
+) {
+  if (
+    !env.TBC_API_SECRET ||
+    !env.MONETAG_REWARD_COORDINATOR
+  ) {
+    return respond({
+      ok: false,
+      error: "Coordinator binding or API secret is missing"
+    }, 503);
+  }
+
+  if (
+    request.headers.get("Authorization") !==
+    "Bearer " + env.TBC_API_SECRET
+  ) {
+    return respond({
+      ok: false,
+      error: "Unauthorized"
+    }, 401);
+  }
+
+  let data;
+
+  try {
+    data = await request.json();
+  } catch {
+    return respond({
+      ok: false,
+      error: "Invalid JSON"
+    }, 400);
+  }
+
+  if (data.test_id !== "rapid-ads-coordinator-health-test") {
+    return respond({
+      ok: false,
+      error: "Invalid test identifier"
+    }, 400);
+  }
+
+  try {
+    const coordinatorId =
+      env.MONETAG_REWARD_COORDINATOR.idFromName(
+        "rapid-ads-health-check"
+      );
+
+    const coordinator =
+      env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
+
+    const coordinatorResponse = await coordinator.fetch(
+      "https://coordinator.internal/",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          action: "health_check"
+        })
+      }
+    );
+
+    const responseText =
+      await coordinatorResponse.text();
+
+    let coordinatorResult;
+
+    try {
+      coordinatorResult = JSON.parse(responseText);
+    } catch {
+      coordinatorResult = {
+        message: "Coordinator returned an invalid response"
+      };
+    }
+
+    return respond({
+      ok: coordinatorResponse.ok,
+      coordinator_http_status: coordinatorResponse.status,
+      coordinator_result: coordinatorResult,
+      read_only: true,
+      message: coordinatorResponse.ok
+        ? "Coordinator health check completed. No rewards were credited."
+        : "Coordinator responded with an error."
+    }, coordinatorResponse.ok ? 200 : 502);
+
+  } catch (error) {
+    console.error("Coordinator health check failed:", error);
+
+    return respond({
+      ok: false,
+      error: "Could not contact the reward coordinator",
+      read_only: true
+    }, 502);
+  }
+}
+// ==========================================
+// END MONETAG COORDINATOR HEALTH CHECK
+// ==========================================
     if (request.method !== "GET") {
       return respond({
         ok: false,
