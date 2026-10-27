@@ -1489,7 +1489,99 @@ if (
 // ==========================================
 // END PROTECTED BALANCE RESULT CHECK
 // ==========================================
-   // ==========================================
+// ==========================================
+// MONETAG WEBHOOK TEST — READ ONLY
+// ==========================================
+if (request.method === "POST" && url.pathname === "/tbc-monetag-webhook-test") {
+  try {
+    const auth = request.headers.get("Authorization") || "";
+
+    if (!env.TBC_API_SECRET || auth !== `Bearer ${env.TBC_API_SECRET}`) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "Unauthorized" }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" }
+        }
+      );
+    }
+
+    if (!env.TBC_MONETAG_REWARD_WEBHOOK_URL) {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "Monetag reward webhook secret is not configured"
+        }),
+        {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        }
+      );
+    }
+
+    const body = await request.json();
+
+    if (body.test_id !== "rapid-ads-monetag-webhook-test") {
+      return new Response(
+        JSON.stringify({ ok: false, error: "Invalid test request" }),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        }
+      );
+    }
+
+    const requestId = crypto.randomUUID();
+
+    const webhookResponse = await fetch(
+      env.TBC_MONETAG_REWARD_WEBHOOK_URL,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          user_id: "6694470603",
+          request_id: requestId,
+          ymid: "test_" + requestId
+        })
+      }
+    );
+
+    const responseText = await webhookResponse.text();
+
+    return new Response(
+      JSON.stringify({
+        ok: webhookResponse.ok,
+        webhook_http_status: webhookResponse.status,
+        request_id: requestId,
+        response_preview: responseText.slice(0, 500),
+        read_only: true,
+        message: "Test completed. No balance was changed by this test route."
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      }
+    );
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: String(error),
+        read_only: true
+      }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      }
+    );
+  }
+}
+// ==========================================
+// END MONETAG WEBHOOK TEST
+// ==========================================   
+    // ==========================================
 // TEMPORARY MONETAG EVENT CHECK — READ ONLY
 // ==========================================
 if (
