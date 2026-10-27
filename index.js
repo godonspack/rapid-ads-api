@@ -2312,6 +2312,57 @@ if (data.action === "check_cooldown") {
         message: "Test cooldown started. No balance or reward was changed."
       });
         }
+    // Atomically check and start the 60-second cooldown.
+    if (data.action === "check_and_start_cooldown") {
+      const userId = String(data.user_id || "");
+
+      if (!/^\d{1,25}$/.test(userId)) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID"
+        }, 400);
+      }
+
+      const key = `monetag:last_watch:${userId}`;
+      const now = Date.now();
+      const cooldownSeconds = 60;
+
+      // Keep the read-and-write together to prevent concurrent requests
+      // from both passing the cooldown check.
+      return await this.ctx.storage.transaction(async (txn) => {
+        const lastRaw = await txn.get(key);
+        const lastTime = Number(lastRaw || 0);
+        const elapsedSeconds = Math.floor((now - lastTime) / 1000);
+        const remaining = Math.max(
+          0,
+          cooldownSeconds - elapsedSeconds
+        );
+
+        if (remaining > 0) {
+          return respond({
+            ok: true,
+            user_id: userId,
+            cooldown_seconds: cooldownSeconds,
+            remaining_seconds: remaining,
+            can_watch: false,
+            cooldown_started: false,
+            message: "Cooldown is active."
+          });
+        }
+
+        await txn.put(key, now);
+
+        return respond({
+          ok: true,
+          user_id: userId,
+          cooldown_seconds: cooldownSeconds,
+          remaining_seconds: cooldownSeconds,
+          can_watch: true,
+          cooldown_started: true,
+          message: "Cooldown started. No reward was credited."
+        });
+      });
+        }
     // Validate supplied records without changing anything.
     if (data.action === "validate_event") {
       const session = data.session;
