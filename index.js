@@ -2195,6 +2195,32 @@ if (data.action === "check_cooldown") {
     message: "Cooldown checked. No cooldown or reward data was changed."
   });
   }
+        // TEST ONLY: start a 60-second cooldown without crediting rewards
+    if (data.action === "test_start_cooldown") {
+      const userId = String(data.user_id || "");
+
+      if (!/^\d{1,25}$/.test(userId)) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID",
+          test_only: true
+        }, 400);
+      }
+
+      await this.ctx.storage.put(
+        `monetag:last_watch:${userId}`,
+        Date.now()
+      );
+
+      return respond({
+        ok: true,
+        user_id: userId,
+        cooldown_seconds: 60,
+        test_only: true,
+        reward_credited: false,
+        message: "Test cooldown started. No balance or reward was changed."
+      });
+        }
     // Validate supplied records without changing anything.
     if (data.action === "validate_event") {
       const session = data.session;
