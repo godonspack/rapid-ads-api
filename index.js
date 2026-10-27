@@ -1968,6 +1968,91 @@ if (
     }, 500);
   }
     }
+    // ==========================================
+// MONETAG COOLDOWN ENFORCEMENT
+// ==========================================
+if (
+  url.pathname === "/monetag-cooldown-start" &&
+  request.method === "POST"
+) {
+  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
+    return respond({
+      ok: false,
+      error: "Required API configuration is missing"
+    }, 503);
+  }
+
+  if (
+    request.headers.get("Authorization") !==
+    "Bearer " + env.TBC_API_SECRET
+  ) {
+    return respond({
+      ok: false,
+      error: "Unauthorized"
+    }, 401);
+  }
+
+  let data;
+
+  try {
+    data = await request.json();
+  } catch {
+    return respond({
+      ok: false,
+      error: "Invalid JSON"
+    }, 400);
+  }
+
+  const userId = String(data.user_id || "");
+
+  if (!/^\d{1,25}$/.test(userId)) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID"
+    }, 400);
+  }
+
+  try {
+    const coordinatorId =
+      env.MONETAG_REWARD_COORDINATOR.idFromName(
+        "cooldown:" + userId
+      );
+
+    const coordinator =
+      env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
+
+    const coordinatorResponse = await coordinator.fetch(
+      "https://coordinator.internal/",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          action: "check_and_start_cooldown",
+          user_id: userId
+        })
+      }
+    );
+
+    const result = await coordinatorResponse.json();
+
+    return respond({
+      ok: coordinatorResponse.ok && result.ok === true,
+      coordinator_http_status: coordinatorResponse.status,
+      result: result,
+      message: "Cooldown enforcement completed. No reward was credited."
+    }, coordinatorResponse.ok ? 200 : 502);
+
+  } catch (error) {
+    console.error("Monetag cooldown enforcement failed:", error);
+
+    return respond({
+      ok: false,
+      error: "Cooldown enforcement failed"
+    }, 500);
+  }
+    }
 // ==========================================
 // END MONETAG COOLDOWN CHECK
 // ==========================================
