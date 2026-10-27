@@ -2069,7 +2069,38 @@ export class MonetagRewardCoordinator {
         message: "Coordinator is running. No rewards were credited."
       });
     }
+// Read-only Monetag cooldown check (60 seconds)
+if (data.action === "check_cooldown") {
+  const userId = String(data.user_id || "");
+  const now = Date.now();
+  const cooldownSeconds = 60;
 
+  if (!/^\d{1,25}$/.test(userId)) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID",
+      read_only: true
+    }, 400);
+  }
+
+  const lastKey = `monetag:last_watch:${userId}`;
+  const lastRaw = await this.ctx.storage.get(lastKey);
+  const lastTime = Number(lastRaw || 0);
+  const remaining = Math.max(
+    0,
+    cooldownSeconds - Math.floor((now - lastTime) / 1000)
+  );
+
+  return respond({
+    ok: true,
+    user_id: userId,
+    cooldown_seconds: cooldownSeconds,
+    remaining_seconds: remaining,
+    can_watch: remaining === 0,
+    read_only: true,
+    message: "Cooldown checked. No cooldown or reward data was changed."
+  });
+  }
     // Validate supplied records without changing anything.
     if (data.action === "validate_event") {
       const session = data.session;
