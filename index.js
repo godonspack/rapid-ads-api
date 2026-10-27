@@ -1789,6 +1789,223 @@ if (
 // ==========================================
 // END MONETAG COORDINATOR HEALTH CHECK
 // ==========================================
+    // ==========================================
+// MONETAG EVENT VALIDATION — READ ONLY
+// ==========================================
+if (
+  url.pathname === "/monetag-validate-event" &&
+  request.method === "POST"
+) {
+  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
+    return respond({
+      ok: false,
+      error: "Required API configuration is missing",
+      read_only: true
+    }, 503);
+  }
+
+  if (
+    request.headers.get("Authorization") !==
+    "Bearer " + env.TBC_API_SECRET
+  ) {
+    return respond({
+      ok: false,
+      error: "Unauthorized",
+      read_only: true
+    }, 401);
+  }
+
+  let data;
+
+  try {
+    data = await request.json();
+  } catch {
+    return respond({
+      ok: false,
+      error: "Invalid JSON",
+      read_only: true
+    }, 400);
+  }
+
+  const ymid = String(data.ymid || "");
+  const telegramId = String(data.user_id || "");
+
+  if (
+    !/^ra_[A-Za-z0-9_-]{1,120}$/.test(ymid) ||
+    !/^\d{1,25}$/.test(telegramId)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid session ID or user ID",
+      read_only: true
+    }, 400);
+  }
+
+  try {
+    const sessionRaw =
+      await env.RAPID_ADS_BALANCES.get(`monetag:session:${ymid}`);
+
+    if (!sessionRaw) {
+      return respond({
+        ok: true,
+        valid: false,
+        reason: "Session not found",
+        read_only: true
+      });
+    }
+
+    let session;
+
+    try {
+      session = JSON.parse(sessionRaw);
+    } catch {
+      return respond({
+        ok: false,
+        error: "Stored session data is invalid",
+        read_only: true
+      }, 500);
+    }
+
+    if (
+      !session ||
+      String(session.user_id || "") !== telegramId ||
+      String(session.ymid || "") !== ymid
+    ) {
+      return respond({
+        ok: true,
+        valid: false,
+        reason: "Session user verification failed",
+        read_only: true
+      });
+    }
+
+    const eventTypes = ["impression", "click"];
+    const rewardTypes = ["valued", "non_valued"];
+    const events = [];
+
+    for (const eventType of eventTypes) {
+      for (const rewardType of rewardTypes) {
+        const eventKey =
+          `monetag:event:${ymid}:${eventType}:${rewardType}`;
+
+        const eventRaw =
+          await env.RAPID_ADS_BALANCES.get(eventKey);
+
+        if (!eventRaw) {
+          continue;
+        }
+
+        let event;
+
+        try {
+          event = JSON.parse(eventRaw);
+        } catch {
+          continue;
+        }
+
+        if (
+          !event ||
+          String(event.ymid || "") !== ymid ||
+          String(event.user_id || "") !== telegramId ||
+          event.event_type !== eventType ||
+          event.reward_event_type !== rewardType
+        ) {
+          continue;
+        }
+
+        events.push(event);
+      }
+    }
+
+    if (events.length === 0) {
+      return respond({
+        ok: true,
+        valid: false,
+        reason: "No matching stored event found",
+        read_only: true
+      });
+    }
+
+    const results = [];
+
+    for (const event of events) {
+      const coordinatorId =
+        env.MONETAG_REWARD_COORDINATOR.idFromName(
+          `validate:${ymid}:${event.event_type}:${event.reward_event_type}`
+        );
+
+      const coordinator =
+        env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
+
+      const coordinatorResponse = await coordinator.fetch(
+        "https://coordinator.internal/",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            action: "validate_event",
+            session: {
+              user_id: String(session.user_id),
+              ymid: String(session.ymid)
+            },
+            event: {
+              ymid: String(event.ymid),
+              user_id: String(event.user_id),
+              event_type: event.event_type,
+              reward_event_type: event.reward_event_type,
+              reward_eligible: event.reward_eligible === true,
+              credited: event.credited === false
+                ? false
+                : event.credited
+            }
+          })
+        }
+      );
+
+      let coordinatorResult;
+
+      try {
+        coordinatorResult = await coordinatorResponse.json();
+      } catch {
+        coordinatorResult = {
+          ok: false,
+          error: "Invalid coordinator response"
+        };
+      }
+
+      results.push({
+        event_type: event.event_type,
+        reward_event_type: event.reward_event_type,
+        coordinator_http_status: coordinatorResponse.status,
+        validation: coordinatorResult
+      });
+    }
+
+    return respond({
+      ok: true,
+      ymid: ymid,
+      session_found: true,
+      event_count: results.length,
+      results: results,
+      read_only: true,
+      message: "Validation completed. No balance or event record was changed."
+    });
+
+  } catch (error) {
+    console.error("Monetag event validation failed:", error);
+
+    return respond({
+      ok: false,
+      error: "Could not complete event validation",
+      read_only: true
+    }, 500);
+  }
+}
+// ==========================================
+// END MONETAG EVENT VALIDATION
+// ==========================================
     if (request.method !== "GET") {
       return respond({
         ok: false,
