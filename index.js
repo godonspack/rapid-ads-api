@@ -1877,6 +1877,97 @@ if (
     }, 500);
   }
 }
+    // ==========================================
+// MONETAG COOLDOWN START — TEST ONLY
+// ==========================================
+if (
+  url.pathname === "/monetag-cooldown-start-test" &&
+  request.method === "POST"
+) {
+  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
+    return respond({
+      ok: false,
+      error: "Required API configuration is missing",
+      test_only: true
+    }, 503);
+  }
+
+  if (
+    request.headers.get("Authorization") !==
+    "Bearer " + env.TBC_API_SECRET
+  ) {
+    return respond({
+      ok: false,
+      error: "Unauthorized",
+      test_only: true
+    }, 401);
+  }
+
+  let data;
+
+  try {
+    data = await request.json();
+  } catch {
+    return respond({
+      ok: false,
+      error: "Invalid JSON",
+      test_only: true
+    }, 400);
+  }
+
+  const userId = String(data.user_id || "");
+
+  if (!/^\d{1,25}$/.test(userId)) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID",
+      test_only: true
+    }, 400);
+  }
+
+  try {
+    const coordinatorId =
+      env.MONETAG_REWARD_COORDINATOR.idFromName(
+        "cooldown:" + userId
+      );
+
+    const coordinator =
+      env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
+
+    const coordinatorResponse = await coordinator.fetch(
+      "https://coordinator.internal/",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          action: "test_start_cooldown",
+          user_id: userId
+        })
+      }
+    );
+
+    const result = await coordinatorResponse.json();
+
+    return respond({
+      ok: coordinatorResponse.ok,
+      coordinator_http_status: coordinatorResponse.status,
+      result: result,
+      test_only: true,
+      message: "Test cooldown started. No rewards were credited."
+    }, coordinatorResponse.ok ? 200 : 502);
+
+  } catch (error) {
+    console.error("Monetag test cooldown start failed:", error);
+
+    return respond({
+      ok: false,
+      error: "Test cooldown start failed",
+      test_only: true
+    }, 500);
+  }
+    }
 // ==========================================
 // END MONETAG COOLDOWN CHECK
 // ==========================================
