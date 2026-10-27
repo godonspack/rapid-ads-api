@@ -1815,19 +1815,21 @@ export class MonetagRewardCoordinator {
   }
 
   async fetch(request) {
+    const headers = {
+      "Content-Type": "application/json"
+    };
+
+    const respond = (data, status = 200) =>
+      new Response(JSON.stringify(data), {
+        status,
+        headers
+      });
+
     if (request.method !== "POST") {
-      return new Response(
-        JSON.stringify({
-          ok: false,
-          error: "Method not allowed"
-        }),
-        {
-          status: 405,
-          headers: {
-            "Content-Type": "application/json"
-          }
-        }
-      );
+      return respond({
+        ok: false,
+        error: "Method not allowed"
+      }, 405);
     }
 
     let data;
@@ -1835,48 +1837,82 @@ export class MonetagRewardCoordinator {
     try {
       data = await request.json();
     } catch {
-      return new Response(
-        JSON.stringify({
-          ok: false,
-          error: "Invalid JSON"
-        }),
-        {
-          status: 400,
-          headers: {
-            "Content-Type": "application/json"
-          }
-        }
-      );
+      return respond({
+        ok: false,
+        error: "Invalid JSON"
+      }, 400);
     }
 
-    if (data.action !== "health_check") {
-      return new Response(
-        JSON.stringify({
-          ok: false,
-          error: "Only health checks are enabled"
-        }),
-        {
-          status: 400,
-          headers: {
-            "Content-Type": "application/json"
-          }
-        }
-      );
-    }
-
-    return new Response(
-      JSON.stringify({
+    // Preserve the existing read-only health check.
+    if (data.action === "health_check") {
+      return respond({
         ok: true,
         coordinator: "MonetagRewardCoordinator",
         mode: "read_only",
         message: "Coordinator is running. No rewards were credited."
-      }),
-      {
-        status: 200,
-        headers: {
-          "Content-Type": "application/json"
-        }
+      });
+    }
+
+    // Validate supplied records without changing anything.
+    if (data.action === "validate_event") {
+      const session = data.session;
+      const event = data.event;
+
+      if (
+        !session ||
+        !event ||
+        typeof session !== "object" ||
+        typeof event !== "object"
+      ) {
+        return respond({
+          ok: false,
+          valid: false,
+          error: "Session and event records are required",
+          read_only: true
+        }, 400);
       }
-    );
+
+      const sameUser =
+        String(session.user_id || "") !== "" &&
+        String(session.user_id) === String(event.user_id || "");
+
+      const sameYmid =
+        String(session.ymid || "") !== "" &&
+        String(session.ymid) === String(event.ymid || "");
+
+      const valuedEvent =
+        event.reward_event_type === "valued" &&
+        event.reward_eligible === true;
+
+      const notCredited =
+        event.credited === false;
+
+      const valid =
+        sameUser &&
+        sameYmid &&
+        valuedEvent &&
+        notCredited;
+
+      return respond({
+        ok: true,
+        valid: valid,
+        checks: {
+          session_user_matches_event: sameUser,
+          session_ymid_matches_event: sameYmid,
+          valued_event_is_eligible: valuedEvent,
+          event_not_already_credited: notCredited
+        },
+        read_only: true,
+        message: valid
+          ? "Event passed preliminary validation. No reward was credited."
+          : "Event failed one or more validation checks. No reward was credited."
+      });
+    }
+
+    return respond({
+      ok: false,
+      error: "Unsupported action",
+      read_only: true
+    }, 400);
   }
-}
+  }
