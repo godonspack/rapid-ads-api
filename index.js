@@ -1028,8 +1028,54 @@ if (
         error: "Session user verification failed"
       }, 403);
     }
+    // 7. Allow only one qualifying valued-event claim per Monetag session.
+// This records a claim only; it does not credit any reward.
+if (rewardType === "valued") {
+  const coordinatorId =
+    env.MONETAG_REWARD_COORDINATOR.idFromName(
+      "cooldown:" + String(session.user_id)
+    );
 
-    // 7. Record the event separately by event and reward type.
+  const coordinator =
+    env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
+
+  const claimResponse = await coordinator.fetch(
+    "https://coordinator.internal/",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        action: "claim_valued_event",
+        user_id: String(session.user_id),
+        ymid: ymid
+      })
+    }
+  );
+
+  const claimResult = await claimResponse.json();
+
+  if (!claimResponse.ok || claimResult.ok !== true) {
+    return respond({
+      ok: false,
+      credited: false,
+      error: "Could not safely validate the Monetag claim."
+    }, 502);
+  }
+
+  if (claimResult.claimed !== true) {
+    return respond({
+      ok: true,
+      duplicate: true,
+      reward_eligible: false,
+      credited: false,
+      message: "This Monetag session has already claimed its valued event."
+    });
+  }
+}
+
+// 8. Record the event separately by event and reward type.
     // This allows a non-valued event to arrive before a valued event.
     const eventKey =
       `monetag:event:${ymid}:${eventType}:${rewardType}`;
@@ -2790,6 +2836,55 @@ if (data.action === "check_cooldown") {
       });
         }
     // Atomically check and start the 60-second cooldown.
+    // Atomically allow only one qualifying claim per Monetag session.
+// This records a claim only; it does not credit any reward.
+if (data.action === "claim_valued_event") {
+  const userId = String(data.user_id || "");
+  const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID or Monetag session ID",
+      credited: false
+    }, 400);
+  }
+
+  const claimKey = `monetag:claim:${ymid}`;
+  const now = Date.now();
+
+  return await this.ctx.storage.transaction(async (txn) => {
+    const existing = await txn.get(claimKey);
+
+    if (existing) {
+      return respond({
+        ok: true,
+        claimed: false,
+        duplicate: true,
+        credited: false,
+        message: "This Monetag session already has a claim."
+      });
+    }
+
+    await txn.put(claimKey, {
+      user_id: userId,
+      ymid: ymid,
+      claimed_at: now,
+      credited: false
+    });
+
+    return respond({
+      ok: true,
+      claimed: true,
+      duplicate: false,
+      credited: false,
+      message: "Claim recorded once. No reward was credited."
+    });
+  });
+  }
     if (data.action === "check_and_start_cooldown") {
       const userId = String(data.user_id || "");
 
