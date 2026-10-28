@@ -2843,7 +2843,47 @@ if (data.action === "check_cooldown") {
     // Atomically check and start the 60-second cooldown.
     // Atomically allow only one qualifying claim per Monetag session.
 // This records a claim only; it does not credit any reward.
-if (data.action === "claim_valued_event") {
+// TEMPORARY TEST: call the actual claim handler twice.
+// No reward is credited by this test.
+if (data.action === "test_claim_duplicate") {
+  const testYmid = `test_duplicate_${Date.now()}`;
+  const testUserId = "6694470603";
+
+  const makeClaim = () =>
+    new Request("https://coordinator.internal/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "claim_valued_event",
+        user_id: testUserId,
+        ymid: testYmid
+      })
+    });
+
+  const firstResponse = await this.fetch(makeClaim());
+  const firstResult = await firstResponse.json();
+
+  const secondResponse = await this.fetch(makeClaim());
+  const secondResult = await secondResponse.json();
+
+  return respond({
+    test: true,
+    first_claim: {
+      ok: firstResult.ok,
+      claimed: firstResult.claimed,
+      duplicate: firstResult.duplicate,
+      credited: firstResult.credited
+    },
+    second_claim: {
+      ok: secondResult.ok,
+      claimed: secondResult.claimed,
+      duplicate: secondResult.duplicate,
+      credited: secondResult.credited
+    },
+    expected: "First claim accepted; second claim rejected as duplicate. No reward credited."
+  });
+  }
+  if (data.action === "claim_valued_event") {
   const userId = String(data.user_id || "");
   const ymid = String(data.ymid || "");
 
