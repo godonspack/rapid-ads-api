@@ -2157,9 +2157,16 @@ if (
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          action: "check_and_start_cooldown",
-          user_id: userId
-        })
+  action: [
+    "reserve_watch",
+    "finish_watch",
+    "cancel_watch"
+  ].includes(data.action)
+    ? data.action
+    : "check_and_start_cooldown",
+  user_id: userId,
+  reservation_token: data.reservation_token
+})
       }
     );
 
