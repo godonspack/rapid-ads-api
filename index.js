@@ -1055,7 +1055,12 @@ if (rewardType === "valued") {
   );
 
   const claimResult = await claimResponse.json();
-
+console.log("Monetag claim diagnostic:", {
+  ok: claimResult.ok === true,
+  claimed: claimResult.claimed === true,
+  duplicate: claimResult.duplicate === true,
+  credited: claimResult.credited === true
+});
   if (!claimResponse.ok || claimResult.ok !== true) {
     return respond({
       ok: false,
