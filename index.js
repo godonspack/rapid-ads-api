@@ -2158,13 +2158,13 @@ if (
         },
         body: JSON.stringify({
   action: [
-  "check_cooldown",
-  "reserve_watch",
-  "finish_watch",
-  "cancel_watch"
-].includes(data.action)
-  ? data.action
-  : "check_cooldown",
+    "check_cooldown",
+    "reserve_watch",
+    "finish_watch",
+    "cancel_watch"
+  ].includes(data.action)
+    ? data.action
+    : "check_cooldown",
   user_id: userId,
   reservation_token: data.reservation_token
 })
