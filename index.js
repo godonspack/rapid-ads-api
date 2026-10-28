@@ -695,19 +695,19 @@ const ymid = data.ymid;
 const reservationToken = data.reservation_token;
 
       if (
-        typeof initData !== "string" ||
-        initData.length === 0 ||
-        initData.length > 10000 ||
-        typeof ymid !== "string" ||
-        !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
-      typeof reservationToken !== "string" ||
-reservationToken.length === 0 ||
-reservationToken.length > 200 ||
-      ) {
-        return respond({
-          ok: false,
-          error: "Invalid registration data"
-        }, 400);
+  typeof initData !== "string" ||
+  initData.length === 0 ||
+  initData.length > 10000 ||
+  typeof ymid !== "string" ||
+  !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid) ||
+  typeof reservationToken !== "string" ||
+  reservationToken.length === 0 ||
+  reservationToken.length > 200
+) {
+  return respond({
+    ok: false,
+    error: "Invalid registration data"
+  }, 400);
       }
 
       try {
