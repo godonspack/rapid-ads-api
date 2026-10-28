@@ -1,4 +1,4 @@
-export default {
+6export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
@@ -2475,6 +2475,64 @@ export class MonetagRewardCoordinator {
         message: "Coordinator is running. No rewards were credited."
       });
     }
+    // Securely bind one Monetag session to an active reservation.
+if (data.action === "bind_ymid") {
+  const userId = String(data.user_id || "");
+  const reservationToken = String(data.reservation_token || "");
+  const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !reservationToken ||
+    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID, reservation token, or session ID"
+    }, 400);
+  }
+
+  const reservationKey = `monetag:reservation:${userId}`;
+  const now = Date.now();
+
+  return await this.ctx.storage.transaction(async (txn) => {
+    const reservation = await txn.get(reservationKey);
+
+    if (
+      !reservation ||
+      reservation.token !== reservationToken ||
+      Number(reservation.expires_at || 0) <= now
+    ) {
+      return respond({
+        ok: false,
+        error: "Reservation is invalid or expired"
+      }, 409);
+    }
+
+    if (
+      reservation.ymid &&
+      reservation.ymid !== ymid
+    ) {
+      return respond({
+        ok: false,
+        error: "Reservation is already bound to another session"
+      }, 409);
+    }
+
+    await txn.put(reservationKey, {
+      ...reservation,
+      ymid: ymid,
+      bound_at: now
+    });
+
+    return respond({
+      ok: true,
+      bound: true,
+      reward_credited: false,
+      message: "Session bound to reservation. No reward was credited."
+    });
+  });
+  }
         // Reserve one Monetag watch session without starting the cooldown.
     if (data.action === "reserve_watch") {
       const userId = String(data.user_id || "");
