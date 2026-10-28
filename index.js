@@ -2467,6 +2467,154 @@ export class MonetagRewardCoordinator {
         message: "Coordinator is running. No rewards were credited."
       });
     }
+        // Reserve one Monetag watch session without starting the cooldown.
+    if (data.action === "reserve_watch") {
+      const userId = String(data.user_id || "");
+
+      if (!/^\d{1,25}$/.test(userId)) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID"
+        }, 400);
+      }
+
+      const now = Date.now();
+      const cooldownKey = `monetag:last_watch:${userId}`;
+      const reservationKey = `monetag:reservation:${userId}`;
+      const reservationLifetimeMs = 10 * 60 * 1000;
+
+      return await this.ctx.storage.transaction(async (txn) => {
+        const lastRaw = await txn.get(cooldownKey);
+        const lastTime = Number(lastRaw || 0);
+        const remaining = Math.max(
+          0,
+          60 - Math.floor((now - lastTime) / 1000)
+        );
+
+        if (remaining > 0) {
+          return respond({
+            ok: true,
+            can_watch: false,
+            remaining_seconds: remaining,
+            message: "Cooldown is active."
+          });
+        }
+
+        const existing = await txn.get(reservationKey);
+
+        if (
+          existing &&
+          Number(existing.expires_at || 0) > now
+        ) {
+          return respond({
+            ok: true,
+            can_watch: false,
+            reservation_active: true,
+            message: "An advertisement session is already in progress."
+          });
+        }
+
+        const reservationToken = crypto.randomUUID();
+
+        await txn.put(reservationKey, {
+          token: reservationToken,
+          created_at: now,
+          expires_at: now + reservationLifetimeMs
+        });
+
+        return respond({
+          ok: true,
+          can_watch: true,
+          reservation_token: reservationToken,
+          message: "Watch session reserved. Cooldown has not started."
+        });
+      });
+    }
+
+    // Finish a reserved ad attempt and start the 60-second cooldown.
+    if (data.action === "finish_watch") {
+      const userId = String(data.user_id || "");
+      const reservationToken = String(data.reservation_token || "");
+
+      if (
+        !/^\d{1,25}$/.test(userId) ||
+        !reservationToken
+      ) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID or reservation token"
+        }, 400);
+      }
+
+      const reservationKey = `monetag:reservation:${userId}`;
+      const cooldownKey = `monetag:last_watch:${userId}`;
+      const now = Date.now();
+
+      return await this.ctx.storage.transaction(async (txn) => {
+        const reservation = await txn.get(reservationKey);
+
+        if (
+          !reservation ||
+          reservation.token !== reservationToken ||
+          Number(reservation.expires_at || 0) <= now
+        ) {
+          return respond({
+            ok: false,
+            error: "Watch session is invalid or expired"
+          }, 409);
+        }
+
+        await txn.put(cooldownKey, now);
+        await txn.delete(reservationKey);
+
+        return respond({
+          ok: true,
+          cooldown_seconds: 60,
+          remaining_seconds: 60,
+          cooldown_started: true,
+          reward_credited: false,
+          message: "Watch attempt finished. Cooldown started; no reward was credited."
+        });
+      });
+    }
+
+    // Cancel a reserved session if the ad fails to open.
+    if (data.action === "cancel_watch") {
+      const userId = String(data.user_id || "");
+      const reservationToken = String(data.reservation_token || "");
+
+      if (
+        !/^\d{1,25}$/.test(userId) ||
+        !reservationToken
+      ) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID or reservation token"
+        }, 400);
+      }
+
+      const reservationKey = `monetag:reservation:${userId}`;
+
+      return await this.ctx.storage.transaction(async (txn) => {
+        const reservation = await txn.get(reservationKey);
+
+        if (!reservation || reservation.token !== reservationToken) {
+          return respond({
+            ok: false,
+            error: "Watch session is invalid or already closed"
+          }, 409);
+        }
+
+        await txn.delete(reservationKey);
+
+        return respond({
+          ok: true,
+          cancelled: true,
+          reward_credited: false,
+          message: "Watch reservation cancelled. No reward was credited."
+        });
+      });
+        }
 // Read-only Monetag cooldown check (60 seconds)
 if (data.action === "check_cooldown") {
   const userId = String(data.user_id || "");
