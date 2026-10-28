@@ -2043,8 +2043,8 @@ if (
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-  action: "test_claim_duplicate",
-  user_id: userId
+  action: "test_start_cooldown",
+user_id: userId
 })
       }
     );
