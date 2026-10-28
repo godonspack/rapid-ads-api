@@ -1,4 +1,4 @@
-6export default {
+export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
@@ -669,9 +669,10 @@ if (
       request.method === "POST"
     ) {
       if (
-        !env.TELEGRAM_BOT_TOKEN ||
-        !env.RAPID_ADS_BALANCES
-      ) {
+  !env.TELEGRAM_BOT_TOKEN ||
+  !env.RAPID_ADS_BALANCES ||
+  !env.MONETAG_REWARD_COORDINATOR
+) {
         return respond({
           ok: false,
           error: "Server configuration incomplete"
@@ -690,7 +691,8 @@ if (
       }
 
       const initData = data.initData;
-      const ymid = data.ymid;
+const ymid = data.ymid;
+const reservationToken = data.reservation_token;
 
       if (
         typeof initData !== "string" ||
@@ -698,6 +700,9 @@ if (
         initData.length > 10000 ||
         typeof ymid !== "string" ||
         !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+      typeof reservationToken !== "string" ||
+reservationToken.length === 0 ||
+reservationToken.length > 200 ||
       ) {
         return respond({
           ok: false,
@@ -834,8 +839,53 @@ if (
             ok: false,
             error: "Invalid Telegram user ID"
           }, 401);
-        }
+      }
+// Verify and bind the authenticated user's reservation.
+const coordinatorId =
+  env.MONETAG_REWARD_COORDINATOR.idFromName(
+    "cooldown:" + userId
+  );
 
+const coordinator =
+  env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
+
+const bindingResponse = await coordinator.fetch(
+  "https://coordinator.internal/",
+  {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      action: "bind_ymid",
+      user_id: userId,
+      reservation_token: reservationToken,
+      ymid: ymid
+    })
+  }
+);
+
+let bindingResult;
+
+try {
+  bindingResult = await bindingResponse.json();
+} catch {
+  return respond({
+    ok: false,
+    error: "Could not verify advertisement reservation"
+  }, 502);
+}
+
+if (
+  !bindingResponse.ok ||
+  bindingResult.ok !== true ||
+  bindingResult.bound !== true
+) {
+  return respond({
+    ok: false,
+    error: "Advertisement reservation could not be verified"
+  }, 409);
+}
         // Do not overwrite an existing session ID.
         const sessionKey = `monetag:session:${ymid}`;
         const existing =
