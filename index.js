@@ -2891,6 +2891,64 @@ if (data.action === "check_cooldown") {
       });
         }
     // Validate supplied records without changing anything.
+    // Record one valued-event claim per Monetag session.
+// This action never credits a reward.
+if (data.action === "claim_valued_event") {
+  const userId = String(data.user_id || "");
+  const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID or Monetag session ID",
+      credited: false
+    }, 400);
+  }
+
+  const claimKey = `monetag:claim:${ymid}`;
+
+  return await this.ctx.storage.transaction(async (txn) => {
+    const existing = await txn.get(claimKey);
+
+    if (existing) {
+      if (String(existing.user_id) !== userId) {
+        return respond({
+          ok: false,
+          error: "Session is already associated with another user",
+          credited: false
+        }, 403);
+      }
+
+      // Same session and user: allow a retry to finish recording
+      // the event in KV. This action does not credit a reward.
+      return respond({
+        ok: true,
+        claimed: true,
+        duplicate: true,
+        credited: false,
+        message: "Existing claim recognized; safe retry allowed."
+      });
+    }
+
+    await txn.put(claimKey, {
+      user_id: userId,
+      ymid: ymid,
+      claimed_at: Date.now(),
+      credited: false
+    });
+
+    return respond({
+      ok: true,
+      claimed: true,
+      duplicate: false,
+      credited: false,
+      message: "Claim recorded; no reward credited."
+    });
+  });
+  }
     if (data.action === "validate_event") {
       const session = data.session;
       const event = data.event;
