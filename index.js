@@ -934,13 +934,14 @@ if (
   request.method === "GET"
 ) {
   if (
-    !env.MONETAG_POSTBACK_SECRET ||
-    !env.RAPID_ADS_BALANCES
-  ) {
-    return respond({
-      ok: false,
-      error: "Server configuration incomplete"
-    }, 503);
+  !env.MONETAG_POSTBACK_SECRET ||
+  !env.RAPID_ADS_BALANCES ||
+  !env.MONETAG_REWARD_COORDINATOR
+) {
+  return respond({
+    ok: false,
+    error: "Server configuration incomplete"
+  }, 503);
   }
 
   // 1. Verify the private postback secret.
