@@ -3004,6 +3004,53 @@ return respond({
 
 });
 }
+   if (data.action === "inspect_session") {
+  const userId = String(data.user_id || "");
+  const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID or session ID",
+      read_only: true
+    }, 400);
+  }
+
+  const attempt = await this.ctx.storage.get(
+    `monetag:attempt:${ymid}`
+  );
+
+  const claim = await this.ctx.storage.get(
+    `monetag:claim:${ymid}`
+  );
+
+  const verified = await this.ctx.storage.get(
+    `monetag:verified:${ymid}`
+  );
+
+  return respond({
+    ok: true,
+    ymid: ymid,
+    user_id: userId,
+    attempt_found: Boolean(attempt),
+    claim_found: Boolean(claim),
+    verified_found: Boolean(verified),
+    attempt_matches_user: Boolean(
+      attempt && String(attempt.user_id) === userId
+    ),
+    claim_matches_user: Boolean(
+      claim && String(claim.user_id) === userId
+    ),
+    verified_matches_user: Boolean(
+      verified && String(verified.user_id) === userId
+    ),
+    reward_credited: false,
+    read_only: true
+  });
+    } 
     if (data.action === "validate_event") {
       const session = data.session;
       const event = data.event;
