@@ -2695,65 +2695,90 @@ if (data.action === "bind_ymid") {
 
     // Finish a reserved ad attempt and start the 60-second cooldown.
     if (data.action === "finish_watch") {
-  const userId = String(data.user_id || "");
-  const reservationToken = String(data.reservation_token || "");
+const userId = String(data.user_id || "");
+const reservationToken = String(data.reservation_token || "");
 
-  if (
-    !/^\d{1,25}$/.test(userId) ||
-    !reservationToken
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid user ID or reservation token"
-    }, 400);
-  }
+if (
+!/^\d{1,25}$/.test(userId) ||
+!reservationToken
+) {
+return respond({
+ok: false,
+error: "Invalid user ID or reservation token",
+reward_credited: false
+}, 400);
+}
 
-  const reservationKey = `monetag:reservation:${userId}`;
-  const cooldownKey = `monetag:last_watch:${userId}`;
-  const now = Date.now();
+const reservationKey = "monetag:reservation:${userId}";
+const cooldownKey = "monetag:last_watch:${userId}";
+const now = Date.now();
 
-  return await this.ctx.storage.transaction(async (txn) => {
-    const reservation = await txn.get(reservationKey);
+return await this.ctx.storage.transaction(async (txn) => {
+const reservation = await txn.get(reservationKey);
 
-    if (
-      !reservation ||
-      reservation.token !== reservationToken ||
-      Number(reservation.expires_at || 0) <= now ||
-      !reservation.ymid
-    ) {
-      return respond({
-        ok: false,
-        error: "Watch session is invalid, expired, or not registered"
-      }, 409);
-    }
+if (
+  !reservation ||
+  reservation.token !== reservationToken ||
+  Number(reservation.expires_at || 0) <= now ||
+  !reservation.ymid
+) {
+  return respond({
+    ok: false,
+    error: "Watch session is invalid, expired, or not registered",
+    reward_credited: false
+  }, 409);
+}
 
-    const ymid = String(reservation.ymid);
+const ymid = String(reservation.ymid);
+const attemptKey = `monetag:attempt:${ymid}`;
+const claimKey = `monetag:claim:${ymid}`;
+const verifiedKey = `monetag:verified:${ymid}`;
 
-    // Preserve evidence that this ad attempt finished.
-    await txn.put(`monetag:attempt:${ymid}`, {
-      user_id: userId,
-      ymid: ymid,
-      completed_at: now,
-      reward_claimed: false
-    });
+const existingClaim = await txn.get(claimKey);
 
-    // Start the existing 60-second cooldown.
-    await txn.put(cooldownKey, now);
+const matchingPostback =
+  existingClaim &&
+  String(existingClaim.user_id) === userId &&
+  String(existingClaim.ymid) === ymid;
 
-    // Close the active reservation.
-    await txn.delete(reservationKey);
+await txn.put(attemptKey, {
+  user_id: userId,
+  ymid: ymid,
+  completed_at: now,
+  reward_claimed: false
+});
 
-    return respond({
-      ok: true,
-      cooldown_seconds: 60,
-      remaining_seconds: 60,
-      cooldown_started: true,
-      attempt_recorded: true,
-      reward_credited: false,
-      message: "Ad attempt recorded and cooldown started. No reward was credited."
-    });
+if (matchingPostback) {
+  await txn.put(verifiedKey, {
+    user_id: userId,
+    ymid: ymid,
+    attempt_recorded: true,
+    valued_postback_recorded: true,
+    matched_at: now,
+    reward_eligible_for_review: true,
+    reward_credited: false
   });
-    }
+}
+
+await txn.put(cooldownKey, now);
+await txn.delete(reservationKey);
+
+return respond({
+  ok: true,
+  cooldown_seconds: 60,
+  remaining_seconds: 60,
+  cooldown_started: true,
+  attempt_recorded: true,
+  postback_matched: Boolean(matchingPostback),
+  reward_eligible_for_review: Boolean(matchingPostback),
+  reward_credited: false,
+  message: matchingPostback
+    ? "Ad attempt and valued postback matched. No reward credited."
+    : "Ad attempt recorded. Waiting for a matching valued postback. No reward credited."
+});
+
+});
+  }
 
     // Cancel a reserved session if the ad fails to open.
     if (data.action === "cancel_watch") {
