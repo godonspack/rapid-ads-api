@@ -2934,61 +2934,76 @@ if (data.action === "check_cooldown") {
     // Record one valued-event claim per Monetag session.
 // This action never credits a reward.
 if (data.action === "claim_valued_event") {
-  const userId = String(data.user_id || "");
-  const ymid = String(data.ymid || "");
+const userId = String(data.user_id || "");
+const ymid = String(data.ymid || "");
 
-  if (
-    !/^\d{1,25}$/.test(userId) ||
-    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid user ID or Monetag session ID",
-      credited: false
-    }, 400);
-  }
+if (
+!/^\d{1,25}$/.test(userId) ||
+!/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+) {
+return respond({
+ok: false,
+error: "Invalid user ID or Monetag session ID",
+credited: false
+}, 400);
+}
 
-  const claimKey = `monetag:claim:${ymid}`;
+const claimKey = "monetag:claim:${ymid}";
+const attemptKey = "monetag:attempt:${ymid}";
+const verifiedKey = "monetag:verified:${ymid}";
 
-  return await this.ctx.storage.transaction(async (txn) => {
-    const existing = await txn.get(claimKey);
+return await this.ctx.storage.transaction(async (txn) => {
+const existing = await txn.get(claimKey);
+const attempt = await txn.get(attemptKey);
 
-    if (existing) {
-      if (String(existing.user_id) !== userId) {
-        return respond({
-          ok: false,
-          error: "Session is already associated with another user",
-          credited: false
-        }, 403);
-      }
+if (existing && String(existing.user_id) !== userId) {
+  return respond({
+    ok: false,
+    error: "Session is already associated with another user",
+    credited: false
+  }, 403);
+}
 
-      // Same session and user: allow a retry to finish recording
-      // the event in KV. This action does not credit a reward.
-      return respond({
-        ok: true,
-        claimed: true,
-        duplicate: true,
-        credited: false,
-        message: "Existing claim recognized; safe retry allowed."
-      });
-    }
-
-    await txn.put(claimKey, {
-      user_id: userId,
-      ymid: ymid,
-      claimed_at: Date.now(),
-      credited: false
-    });
-
-    return respond({
-      ok: true,
-      claimed: true,
-      duplicate: false,
-      credited: false,
-      message: "Claim recorded; no reward credited."
-    });
+if (!existing) {
+  await txn.put(claimKey, {
+    user_id: userId,
+    ymid: ymid,
+    claimed_at: Date.now(),
+    credited: false
   });
-  }
+}
+
+const matchingAttempt =
+  attempt &&
+  String(attempt.user_id) === userId &&
+  String(attempt.ymid) === ymid;
+
+if (matchingAttempt) {
+  await txn.put(verifiedKey, {
+    user_id: userId,
+    ymid: ymid,
+    attempt_recorded: true,
+    valued_postback_recorded: true,
+    matched_at: Date.now(),
+    reward_eligible_for_review: true,
+    reward_credited: false
+  });
+}
+
+return respond({
+  ok: true,
+  claimed: true,
+  duplicate: Boolean(existing),
+  attempt_matched: Boolean(matchingAttempt),
+  reward_eligible_for_review: Boolean(matchingAttempt),
+  credited: false,
+  message: matchingAttempt
+    ? "Valued postback matched with recorded ad attempt. No reward credited."
+    : "Valued postback recorded; waiting for matching ad attempt. No reward credited."
+});
+
+});
+}
     if (data.action === "validate_event") {
       const session = data.session;
       const event = data.event;
