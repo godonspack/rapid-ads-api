@@ -2992,6 +2992,74 @@ return respond({
 
 });
 }
+    // Atomically reserve a verified session for reward processing.
+// This action does not credit any balance.
+if (data.action === "reserve_reward_processing") {
+const userId = String(data.user_id || "");
+const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID or session ID",
+      reward_credited: false
+    }, 400);
+  }
+
+  const verifiedKey = `monetag:verified:${ymid}`;
+  const processingKey = `monetag:reward_processing:${ymid}`;
+
+  return await this.ctx.storage.transaction(async (txn) => {
+    const verified = await txn.get(verifiedKey);
+    const existing = await txn.get(processingKey);
+
+    if (
+      !verified ||
+      String(verified.user_id) !== userId ||
+      String(verified.ymid) !== ymid
+    ) {
+      return respond({
+        ok: false,
+        reserved: false,
+        error: "Verified Monetag session not found",
+        reward_credited: false
+      }, 403);
+    }
+
+    if (existing) {
+      return respond({
+        ok: true,
+        reserved: false,
+        duplicate: true,
+        status: existing.status,
+        reward_credited: false,
+        message: "This session already has a reward-processing record."
+      });
+    }
+
+    const now = Date.now();
+
+    await txn.put(processingKey, {
+      user_id: userId,
+      ymid: ymid,
+      status: "reserved",
+      reserved_at: now,
+      reward_credited: false
+    });
+
+    return respond({
+      ok: true,
+      reserved: true,
+      duplicate: false,
+      status: "reserved",
+      reward_credited: false,
+      message: "Reward processing reserved. No balance was changed."
+    });
+  });
+}
    if (data.action === "inspect_session") {
   const userId = String(data.user_id || "");
   const ymid = String(data.ymid || "");
