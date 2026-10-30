@@ -2511,6 +2511,84 @@ inspection: coordinatorResult
     });
   }
 };
+// TEST: Verify atomic one-time Monetag reward reservation.
+if (
+url.pathname === "/monetag-reserve-reward-test" &&
+request.method === "POST"
+) {
+if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
+return respond({
+ok: false,
+error: "Required configuration is missing"
+}, 503);
+}
+
+  if (
+    request.headers.get("Authorization") !==
+    "Bearer " + env.TBC_API_SECRET
+  ) {
+    return respond({
+      ok: false,
+      error: "Unauthorized"
+    }, 401);
+  }
+
+  let data;
+
+  try {
+    data = await request.json();
+  } catch {
+    return respond({
+      ok: false,
+      error: "Invalid JSON"
+    }, 400);
+  }
+
+  const userId = String(data.user_id || "");
+  const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !/^ra_[A-Za-z0-9_-]{1,120}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID or session ID"
+    }, 400);
+  }
+
+  const coordinatorId =
+    env.MONETAG_REWARD_COORDINATOR.idFromName(
+      "cooldown:" + userId
+    );
+
+  const coordinator =
+    env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
+
+  const result = await coordinator.fetch(
+    "https://coordinator.internal/",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        action: "reserve_reward_processing",
+        user_id: userId,
+        ymid: ymid
+      })
+    }
+  );
+
+  const resultData = await result.json();
+
+  return respond({
+    http_status: result.status,
+    result: resultData,
+    test_only: true,
+    reward_credited: false
+  }, result.status);
+}
 // ==========================================
 // MONETAG REWARD COORDINATOR
 // READ-ONLY TEST VERSION
