@@ -1111,12 +1111,12 @@ if (rewardType === "valued") {
     );
 
     return respond({
-      ok: true,
-      recorded: true,
-      reward_eligible: rewardType === "valued",
-      credited: false,
-      message: "Verified Monetag notification recorded; no reward credited"
-    });
+  ok: true,
+  recorded: true,
+  reward_eligible: false,
+  credited: false,
+  message: "Monetag notification recorded. Reward eligibility must be confirmed through session matching."
+});
 
   } catch (error) {
     console.error("Monetag postback processing failed:", error);
