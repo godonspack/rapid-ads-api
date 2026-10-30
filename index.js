@@ -2432,57 +2432,45 @@ if (
 
     for (const event of events) {
       const coordinatorId =
-        env.MONETAG_REWARD_COORDINATOR.idFromName(
-          `validate:${ymid}:${event.event_type}:${event.reward_event_type}`
-        );
+env.MONETAG_REWARD_COORDINATOR.idFromName(
+"cooldown:" + String(session.user_id)
+);
 
-      const coordinator =
-        env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
+const coordinator =
+env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
 
-      const coordinatorResponse = await coordinator.fetch(
-        "https://coordinator.internal/",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            action: "validate_event",
-            session: {
-              user_id: String(session.user_id),
-              ymid: String(session.ymid)
-            },
-            event: {
-              ymid: String(event.ymid),
-              user_id: String(event.user_id),
-              event_type: event.event_type,
-              reward_event_type: event.reward_event_type,
-              reward_eligible: event.reward_eligible === true,
-              credited: event.credited === false
-                ? false
-                : event.credited
-            }
-          })
-        }
-      );
+const coordinatorResponse = await coordinator.fetch(
+"https://coordinator.internal/",
+{
+method: "POST",
+headers: {
+"Content-Type": "application/json"
+},
+body: JSON.stringify({
+action: "inspect_session",
+user_id: String(session.user_id),
+ymid: ymid
+})
+}
+);
 
-      let coordinatorResult;
+let coordinatorResult;
 
-      try {
-        coordinatorResult = await coordinatorResponse.json();
-      } catch {
-        coordinatorResult = {
-          ok: false,
-          error: "Invalid coordinator response"
-        };
-      }
+try {
+coordinatorResult = await coordinatorResponse.json();
+} catch {
+coordinatorResult = {
+ok: false,
+error: "Invalid coordinator response"
+};
+}
 
-      results.push({
-        event_type: event.event_type,
-        reward_event_type: event.reward_event_type,
-        coordinator_http_status: coordinatorResponse.status,
-        validation: coordinatorResult
-      });
+results.push({
+event_type: event.event_type,
+reward_event_type: event.reward_event_type,
+coordinator_http_status: coordinatorResponse.status,
+inspection: coordinatorResult
+});
     }
 
     return respond({
@@ -2492,7 +2480,7 @@ if (
       event_count: results.length,
       results: results,
       read_only: true,
-      message: "Validation completed. No balance or event record was changed."
+      message: "Session inspection completed. No balance or event record was changed."
     });
 
   } catch (error) {
