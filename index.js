@@ -2709,8 +2709,8 @@ reward_credited: false
 }, 400);
 }
 
-const reservationKey = "monetag:reservation:${userId}";
-const cooldownKey = "monetag:last_watch:${userId}";
+const reservationKey = `monetag:reservation:${userId}`;
+const cooldownKey = `monetag:last_watch:${userId}`;
 const now = Date.now();
 
 return await this.ctx.storage.transaction(async (txn) => {
