@@ -1100,7 +1100,7 @@ if (rewardType === "valued") {
       zone_id: zoneId,
       request_var: requestVar,
       received_at: new Date().toISOString(),
-      reward_eligible: rewardType === "valued",
+      reward_eligible: false,
       credited: false
     };
 
