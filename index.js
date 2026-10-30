@@ -2936,9 +2936,9 @@ credited: false
 }, 400);
 }
 
-const claimKey = "monetag:claim:${ymid}";
-const attemptKey = "monetag:attempt:${ymid}";
-const verifiedKey = "monetag:verified:${ymid}";
+const claimKey = `monetag:claim:${ymid}`;
+const attemptKey = `monetag:attempt:${ymid}`;
+const verifiedKey = `monetag:verified:${ymid}`;
 
 return await this.ctx.storage.transaction(async (txn) => {
 const existing = await txn.get(claimKey);
