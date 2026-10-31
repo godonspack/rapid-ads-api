@@ -3367,6 +3367,77 @@ const ymid = String(data.ymid || "");
     });
   });
 }
+    if (data.action === "authorize_reward_credit") {
+  const userId = String(data.user_id || "");
+  const ymid = String(data.ymid || "");
+
+  if (!userId || !ymid) {
+    return Response.json({
+      ok: false,
+      error: "Missing user_id or ymid."
+    }, { status: 400 });
+  }
+
+  const result = await this.ctx.storage.transaction(async (txn) => {
+    const verified = await txn.get("monetag:verified:" + ymid);
+    const processing = await txn.get(
+      "monetag:reward_processing:" + ymid
+    );
+
+    if (!verified || String(verified.user_id) !== userId) {
+      return {
+        ok: false,
+        authorized: false,
+        error: "Verified session not found for this user."
+      };
+    }
+
+    if (!processing || String(processing.user_id) !== userId) {
+      return {
+        ok: false,
+        authorized: false,
+        error: "Reward processing reservation not found."
+      };
+    }
+
+    if (processing.status !== "reserved") {
+      return {
+        ok: true,
+        authorized: false,
+        duplicate: true,
+        status: processing.status,
+        reward_credited: false,
+        message: "This session has already moved beyond the reserved stage."
+      };
+    }
+
+    const now = Date.now();
+
+    processing.status = "crediting";
+    processing.amount = 0.001;
+    processing.currency = "USD";
+    processing.credit_authorized_at = now;
+    processing.reward_credited = false;
+
+    await txn.put(
+      "monetag:reward_processing:" + ymid,
+      processing
+    );
+
+    return {
+      ok: true,
+      authorized: true,
+      duplicate: false,
+      status: "crediting",
+      amount: 0.001,
+      currency: "USD",
+      reward_credited: false,
+      message: "One credit attempt authorized. No balance was changed."
+    };
+  });
+
+  return Response.json(result);
+  }
     // TEST ONLY: Safely finalize a reserved reward-processing record.
 // This action never credits a balance.
 if (data.action === "finalize_reward_processing_test") {
