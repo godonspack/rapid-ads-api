@@ -2496,13 +2496,7 @@ inspection: coordinatorResult
 // ==========================================
 // END MONETAG EVENT VALIDATION
 // ==========================================
-    if (request.method !== "GET") {
-      return respond({
-        ok: false,
-        error: "Method not allowed"
-      }, 405);
-    }
-// TEST: Verify atomic one-time Monetag reward reservation.
+    // TEMPORARY POST DIAGNOSTIC
 if (url.pathname === "/monetag-reserve-reward-test") {
   return respond({
     diagnostic: true,
@@ -2510,6 +2504,12 @@ if (url.pathname === "/monetag-reserve-reward-test") {
     received_path: url.pathname
   });
 }
+    if (request.method !== "GET") {
+      return respond({
+        ok: false,
+        error: "Method not allowed"
+      }, 405);
+    }
     return respond({
       ok: true,
       service: "Rapid Ads API",
