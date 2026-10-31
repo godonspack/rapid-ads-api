@@ -3298,6 +3298,84 @@ if (data.action === "finalize_reward_processing_test") {
     });
   });
           }
+    // TEST ONLY: Recover an interrupted reward-processing reservation.
+// This action never credits a balance.
+if (data.action === "recover_reward_processing_test") {
+  const userId = String(data.user_id || "");
+  const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !/^ra_[A-Za-z0-9_-]{1,120}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      recovered: false,
+      error: "Invalid user ID or session ID",
+      reward_credited: false
+    }, 400);
+  }
+
+  const verifiedKey = `monetag:verified:${ymid}`;
+  const processingKey = `monetag:reward_processing:${ymid}`;
+
+  return await this.ctx.storage.transaction(async (txn) => {
+    const verified = await txn.get(verifiedKey);
+    const processing = await txn.get(processingKey);
+
+    if (
+      !verified ||
+      String(verified.user_id) !== userId ||
+      !processing ||
+      String(processing.user_id) !== userId
+    ) {
+      return respond({
+        ok: false,
+        recovered: false,
+        error: "Matching verified session or processing record not found",
+        reward_credited: false
+      }, 403);
+    }
+
+    if (processing.status === "test_recovered") {
+      return respond({
+        ok: true,
+        recovered: false,
+        duplicate: true,
+        status: "test_recovered",
+        reward_credited: false
+      });
+    }
+
+    if (processing.status !== "reserved") {
+      return respond({
+        ok: false,
+        recovered: false,
+        error: "Only reserved records can be recovered",
+        status: processing.status,
+        reward_credited: false
+      }, 409);
+    }
+
+    const now = Date.now();
+
+    await txn.put(processingKey, {
+      ...processing,
+      status: "test_recovered",
+      recovered_at: now,
+      reward_credited: false
+    });
+
+    return respond({
+      ok: true,
+      recovered: true,
+      duplicate: false,
+      status: "test_recovered",
+      reward_credited: false,
+      message: "Test reservation recovered. No balance was changed."
+    });
+  });
+      }
    if (data.action === "inspect_session") {
   const userId = String(data.user_id || "");
   const ymid = String(data.ymid || "");
