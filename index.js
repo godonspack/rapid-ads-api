@@ -2504,9 +2504,14 @@ inspection: coordinatorResult
     }
 // TEST: Verify atomic one-time Monetag reward reservation.
 if (
-url.pathname === "/monetag-reserve-reward-test" &&
-request.method === "POST"
+  url.pathname === "/monetag-reserve-reward-test"
 ) {
+  return respond({
+    diagnostic: true,
+    received_method: request.method,
+    received_path: url.pathname
+  });
+}
 if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
 return respond({
 ok: false,
