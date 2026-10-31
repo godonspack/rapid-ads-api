@@ -3700,7 +3700,58 @@ if (data.action === "recover_reward_processing_test") {
     reward_credited: false,
     read_only: true
   });
-    } 
+    }
+        if (data.action === "inspect_reward_processing") {
+      const userId = String(data.user_id || "");
+      const ymid = String(data.ymid || "");
+
+      if (
+        !/^\d{1,25}$/.test(userId) ||
+        !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+      ) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID or session ID",
+          read_only: true
+        }, 400);
+      }
+
+      const verified = await this.ctx.storage.get(
+        `monetag:verified:${ymid}`
+      );
+
+      const processing = await this.ctx.storage.get(
+        `monetag:reward_processing:${ymid}`
+      );
+
+      if (
+        !verified ||
+        String(verified.user_id) !== userId ||
+        !processing ||
+        String(processing.user_id) !== userId
+      ) {
+        return respond({
+          ok: false,
+          found: false,
+          error: "Matching verified processing record not found",
+          read_only: true
+        });
+      }
+
+      return respond({
+        ok: true,
+        found: true,
+        user_id: userId,
+        ymid: ymid,
+        status: processing.status,
+        amount: processing.amount || 0,
+        currency: processing.currency || "USD",
+        reward_credited: processing.reward_credited === true,
+        credit_authorized_at:
+          processing.credit_authorized_at || null,
+        read_only: true
+      });
+      }
     if (data.action === "validate_event") {
       const session = data.session;
       const event = data.event;
