@@ -2739,6 +2739,71 @@ if (
     reward_credited: false
   }, result.status);
     }
+    if (url.pathname === "/monetag-concurrency-test") {
+  if (request.method !== "POST") {
+    return respond({ ok: false, error: "POST required" }, 405);
+  }
+
+  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
+    return respond({ ok: false, error: "Server configuration missing" }, 500);
+  }
+
+  if (request.headers.get("Authorization") !== "Bearer " + env.TBC_API_SECRET) {
+    return respond({ ok: false, error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const body = await request.json();
+    const userId = String(body.user_id || "");
+    const ymid = String(body.ymid || "");
+
+    if (!userId || !ymid) {
+      return respond({ ok: false, error: "Missing user_id or ymid" }, 400);
+    }
+
+    const id = env.MONETAG_REWARD_COORDINATOR.idFromName("cooldown:" + userId);
+    const coordinator = env.MONETAG_REWARD_COORDINATOR.get(id);
+
+    const makeReservation = () => coordinator.fetch(
+      "https://coordinator/reserve",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "reserve_reward_processing",
+          user_id: userId,
+          ymid: ymid
+        })
+      }
+    );
+
+    const [firstResponse, secondResponse] = await Promise.all([
+      makeReservation(),
+      makeReservation()
+    ]);
+
+    const [firstResult, secondResult] = await Promise.all([
+      firstResponse.json(),
+      secondResponse.json()
+    ]);
+
+    return respond({
+      ok: true,
+      test_only: true,
+      first_request: firstResult,
+      second_request: secondResult,
+      reward_credited: false
+    });
+
+  } catch (error) {
+    return respond({
+      ok: false,
+      error: String(error),
+      test_only: true,
+      reward_credited: false
+    }, 500);
+  }
+    }
     if (request.method !== "GET") {
       return respond({
         ok: false,
