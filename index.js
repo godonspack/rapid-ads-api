@@ -3110,6 +3110,71 @@ if (
     }, 500);
   }
   }
+    if (
+  request.method === "POST" &&
+  url.pathname === "/monetag-latest-session"
+) {
+  try {
+    const auth = request.headers.get("Authorization") || "";
+
+    if (
+      !env.TBC_API_SECRET ||
+      auth !== "Bearer " + env.TBC_API_SECRET
+    ) {
+      return respond({ ok: false, error: "Unauthorized" }, 401);
+    }
+
+    const body = await request.json();
+    const userId = String(body.user_id || "");
+
+    if (!/^\d{1,25}$/.test(userId)) {
+      return respond({ ok: false, error: "Invalid user ID" }, 400);
+    }
+
+    const listing = await env.RAPID_ADS_BALANCES.list({
+      prefix: "monetag:session:",
+      limit: 1000
+    });
+
+    const sessions = [];
+
+    for (const key of listing.keys) {
+      const raw = await env.RAPID_ADS_BALANCES.get(key.name);
+
+      if (!raw) continue;
+
+      const session = JSON.parse(raw);
+
+      if (String(session.user_id) === userId) {
+        sessions.push(session);
+      }
+    }
+
+    sessions.sort((a, b) =>
+      String(b.created_at || "").localeCompare(
+        String(a.created_at || "")
+      )
+    );
+
+    return respond({
+      ok: true,
+      user_id: userId,
+      session_found: sessions.length > 0,
+      latest_session: sessions.length > 0 ? sessions[0] : null,
+      sessions_checked: listing.keys.length,
+      read_only: true,
+      balance_credited: false
+    });
+
+  } catch (error) {
+    return respond({
+      ok: false,
+      error: String(error),
+      read_only: true,
+      balance_credited: false
+    }, 500);
+  }
+      }
     if (request.method !== "GET") {
       return respond({
         ok: false,
