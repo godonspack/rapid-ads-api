@@ -3814,6 +3814,70 @@ if (data.action === "recover_reward_processing_test") {
         read_only: true
       });
       }
+        if (data.action === "claim_credit_execution_test") {
+      const userId = String(data.user_id || "");
+      const ymid = String(data.ymid || "");
+
+      if (
+        !/^\d{1,25}$/.test(userId) ||
+        !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+      ) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID or session ID",
+          test_only: true
+        }, 400);
+      }
+
+      const result = await this.ctx.storage.transaction(async (txn) => {
+        const processing = await txn.get(
+          `monetag:reward_processing:${ymid}`
+        );
+
+        if (!processing || String(processing.user_id) !== userId) {
+          return {
+            ok: false,
+            permitted: false,
+            error: "Matching processing record not found."
+          };
+        }
+
+        if (processing.status !== "crediting") {
+          return {
+            ok: true,
+            permitted: false,
+            duplicate: true,
+            status: processing.status,
+            message: "This session cannot receive another execution permit."
+          };
+        }
+
+        processing.status = "test_permit_issued";
+        processing.test_permit_issued_at = Date.now();
+        processing.reward_credited = false;
+
+        await txn.put(
+          `monetag:reward_processing:${ymid}`,
+          processing
+        );
+
+        return {
+          ok: true,
+          permitted: true,
+          duplicate: false,
+          status: "test_permit_issued",
+          amount: processing.amount,
+          currency: processing.currency,
+          reward_credited: false,
+          message: "Test permit issued. No balance was changed."
+        };
+      });
+
+      return respond({
+        ...result,
+        test_only: true
+      });
+  }
     if (data.action === "validate_event") {
       const session = data.session;
       const event = data.event;
