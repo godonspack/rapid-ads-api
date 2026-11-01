@@ -2979,6 +2979,137 @@ if (
     }, 500);
   }
       }
+    if (
+  request.method === "POST" &&
+  url.pathname === "/monetag-retry-recovery-test"
+) {
+  try {
+    const auth = request.headers.get("Authorization") || "";
+
+    if (
+      !env.TBC_API_SECRET ||
+      auth !== "Bearer " + env.TBC_API_SECRET
+    ) {
+      return respond({ ok: false, error: "Unauthorized" }, 401);
+    }
+
+    if (
+      !env.MONETAG_REWARD_COORDINATOR ||
+      !env.RAPID_ADS_BALANCES
+    ) {
+      return respond({
+        ok: false,
+        error: "Required configuration missing"
+      }, 503);
+    }
+
+    const body = await request.json();
+    const userId = String(body.user_id || "");
+
+    if (!/^\d{1,25}$/.test(userId)) {
+      return respond({
+        ok: false,
+        error: "Invalid test user ID"
+      }, 400);
+    }
+
+    const ymid = "ra_retrytest_" + crypto.randomUUID();
+
+    const id = env.MONETAG_REWARD_COORDINATOR.idFromName(
+      "cooldown:" + userId
+    );
+
+    const stub = env.MONETAG_REWARD_COORDINATOR.get(id);
+
+    const claimRequest = async () => {
+      const response = await stub.fetch(
+        "https://coordinator/",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            action: "claim_valued_event",
+            user_id: userId,
+            ymid: ymid
+          })
+        }
+      );
+
+      return await response.json();
+    };
+
+    // First claim: simulate a failed KV write by not writing.
+    const firstClaim = await claimRequest();
+
+    if (!firstClaim.ok || firstClaim.claimed !== true) {
+      return respond({
+        ok: false,
+        stage: "first_claim",
+        result: firstClaim,
+        test_only: true,
+        balance_credited: false
+      }, 500);
+    }
+
+    // Retry the same claim.
+    const retryClaim = await claimRequest();
+
+    if (
+      !retryClaim.ok ||
+      retryClaim.claimed !== true ||
+      retryClaim.duplicate !== true
+    ) {
+      return respond({
+        ok: false,
+        stage: "retry_claim",
+        result: retryClaim,
+        test_only: true,
+        balance_credited: false
+      }, 500);
+    }
+
+    // Now save a synthetic test event.
+    const eventKey =
+      `monetag:retry-test:${ymid}`;
+
+    await env.RAPID_ADS_BALANCES.put(
+      eventKey,
+      JSON.stringify({
+        ymid: ymid,
+        user_id: userId,
+        reward_event_type: "valued",
+        test_only: true,
+        credited: false
+      }),
+      { expirationTtl: 300 }
+    );
+
+    const saved = await env.RAPID_ADS_BALANCES.get(eventKey);
+
+    return respond({
+      ok: true,
+      test_only: true,
+      ymid: ymid,
+      first_claim_succeeded: firstClaim.claimed === true,
+      retry_claim_succeeded: retryClaim.claimed === true,
+      retry_was_duplicate: retryClaim.duplicate === true,
+      event_saved_after_retry: Boolean(saved),
+      simulated_first_kv_write_failure: true,
+      balance_credited: false,
+      message: "Retry recovery test completed."
+    });
+
+  } catch (error) {
+    return respond({
+      ok: false,
+      test_only: true,
+      error: String(error),
+      balance_credited: false
+    }, 500);
+  }
+  }
     if (request.method !== "GET") {
       return respond({
         ok: false,
