@@ -2928,6 +2928,69 @@ if (
     }, 500);
   }
       }
+    if (url.pathname === "/monetag-claim-execution-test") {
+  if (request.method !== "POST") {
+    return respond({ ok: false, error: "POST required." }, 405);
+  }
+
+  if (
+    request.headers.get("Authorization") !==
+    "Bearer " + env.TBC_API_SECRET
+  ) {
+    return respond({ ok: false, error: "Unauthorized." }, 401);
+  }
+
+  try {
+    const body = await request.json();
+    const userId = String(body.user_id || "");
+    const ymid = String(body.ymid || "");
+
+    if (!userId || !ymid) {
+      return respond({
+        ok: false,
+        error: "Missing user_id or ymid."
+      }, 400);
+    }
+
+    const id = env.MONETAG_REWARD_COORDINATOR.idFromName(
+      "cooldown:" + userId
+    );
+
+    const stub = env.MONETAG_REWARD_COORDINATOR.get(id);
+
+    const result = await stub.fetch(
+      "https://coordinator/",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          action: "claim_credit_execution_test",
+          user_id: userId,
+          ymid: ymid
+        })
+      }
+    );
+
+    const data = await result.json();
+
+    return respond({
+      ok: data.ok === true,
+      test_only: true,
+      result: data,
+      balance_credited: false
+    });
+
+  } catch (error) {
+    return respond({
+      ok: false,
+      test_only: true,
+      error: String(error),
+      balance_credited: false
+    }, 500);
+  }
+      }
     if (request.method !== "GET") {
       return respond({
         ok: false,
