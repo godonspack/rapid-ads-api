@@ -17,8 +17,7 @@ const CONFIG = {
 
   TELEGRAM_AUTH_MAX_AGE: 86400,
 
-  // Keep disabled until real payout processing is implemented
-  // and tested.
+  // Payouts are deliberately disabled.
   PAYOUTS_ENABLED: false
 };
 
@@ -357,7 +356,7 @@ async function handleFaucetPayEmail(request, env) {
 }
 
 // ============================================================
-// MONETAG COOLDOWN AND DAILY LIMIT
+// MONETAG DAILY LIMIT AND COOLDOWN
 // ============================================================
 
 async function getMonetagDailyCount(db, telegramId) {
@@ -392,6 +391,10 @@ async function getMonetagCooldown(db, telegramId) {
   );
 }
 
+// ============================================================
+// MONETAG COOLDOWN ACTIONS
+// ============================================================
+
 async function handleMonetagCooldown(request, env) {
   try {
     const { body, user } = await authenticateRequest(request, env);
@@ -401,7 +404,7 @@ async function handleMonetagCooldown(request, env) {
     const now = unixTime();
 
     // --------------------------------------------------------
-    // CANCEL A RESERVATION
+    // CANCEL RESERVATION
     // --------------------------------------------------------
 
     if (action === "cancel_watch") {
@@ -424,7 +427,7 @@ async function handleMonetagCooldown(request, env) {
     }
 
     // --------------------------------------------------------
-    // FINISH A WATCH ATTEMPT
+    // FINISH WATCH
     // --------------------------------------------------------
 
     if (action === "finish_watch") {
@@ -436,7 +439,7 @@ async function handleMonetagCooldown(request, env) {
       }
 
       const session = await db.prepare(`
-        SELECT id, status
+        SELECT id, status, reservation_token
         FROM monetag_sessions
         WHERE telegram_id = ?
         AND ymid = ?
@@ -446,7 +449,12 @@ async function handleMonetagCooldown(request, env) {
         throw new Error("Monetag session not found.");
       }
 
-      // A completed session cannot be completed again.
+      // Validate the token saved during registration.
+      if (session.reservation_token !== token) {
+        throw new Error("Reservation token does not match this session.");
+      }
+
+      // If this session was already finished, return its status.
       const existingCooldown = await db.prepare(`
         SELECT finished_at
         FROM monetag_cooldowns
@@ -472,20 +480,7 @@ async function handleMonetagCooldown(request, env) {
         });
       }
 
-      const reservation = await db.prepare(`
-        SELECT reservation_token, expires_at
-        FROM monetag_reservations
-        WHERE telegram_id = ?
-      `).bind(user.id).first();
-
-      if (
-        !reservation ||
-        reservation.reservation_token !== token ||
-        Number(reservation.expires_at) < now
-      ) {
-        throw new Error("Reservation is invalid or expired.");
-      }
-
+      // Start or update the user's cooldown.
       await db.prepare(`
         INSERT INTO monetag_cooldowns (
           telegram_id,
@@ -493,12 +488,17 @@ async function handleMonetagCooldown(request, env) {
           finished_at
         )
         VALUES (?, ?, ?)
+        ON CONFLICT(telegram_id)
+        DO UPDATE SET
+          session_id = excluded.session_id,
+          finished_at = excluded.finished_at
       `).bind(
         user.id,
         session.id,
         now
       ).run();
 
+      // Remove the reservation after successful completion.
       await db.prepare(`
         DELETE FROM monetag_reservations
         WHERE telegram_id = ?
@@ -521,7 +521,7 @@ async function handleMonetagCooldown(request, env) {
     }
 
     // --------------------------------------------------------
-    // CHECK USER REGISTRATION
+    // REQUIRE FAUCETPAY EMAIL REGISTRATION
     // --------------------------------------------------------
 
     const registeredUser = await getRegisteredUser(db, user.id);
@@ -536,7 +536,7 @@ async function handleMonetagCooldown(request, env) {
     }
 
     // --------------------------------------------------------
-    // CHECK COOLDOWN AND DAILY LIMIT
+    // DAILY LIMIT AND COOLDOWN
     // --------------------------------------------------------
 
     const remaining = await getMonetagCooldown(db, user.id);
@@ -574,7 +574,7 @@ async function handleMonetagCooldown(request, env) {
     }
 
     // --------------------------------------------------------
-    // CREATE A SINGLE RESERVATION
+    // CREATE RESERVATION
     // --------------------------------------------------------
 
     const existingReservation = await db.prepare(`
@@ -594,7 +594,6 @@ async function handleMonetagCooldown(request, env) {
       }, 409);
     }
 
-    // Remove only an expired reservation.
     await db.prepare(`
       DELETE FROM monetag_reservations
       WHERE telegram_id = ?
@@ -634,7 +633,7 @@ async function handleMonetagCooldown(request, env) {
 }
 
 // ============================================================
-// REGISTER A MONETAG SESSION
+// REGISTER MONETAG SESSION
 // ============================================================
 
 async function handleMonetagRegister(request, env) {
@@ -675,7 +674,6 @@ async function handleMonetagRegister(request, env) {
       throw new Error("Reservation is invalid or expired.");
     }
 
-    // Prevent a duplicate Monetag session ID.
     const duplicate = await db.prepare(`
       SELECT id
       FROM monetag_sessions
@@ -688,6 +686,8 @@ async function handleMonetagRegister(request, env) {
 
     const id = randomId("monetag");
 
+    // Save the reservation token with the session.
+    // Do not delete the reservation here.
     await db.prepare(`
       INSERT INTO monetag_sessions (
         id,
@@ -695,22 +695,18 @@ async function handleMonetagRegister(request, env) {
         ymid,
         status,
         reward_units,
-        created_at
+        created_at,
+        reservation_token
       )
-      VALUES (?, ?, ?, 'PENDING', ?, ?)
+      VALUES (?, ?, ?, 'PENDING', ?, ?, ?)
     `).bind(
       id,
       user.id,
       ymid,
       CONFIG.MONETAG_REWARD_UNITS,
-      now
+      now,
+      reservationToken
     ).run();
-
-    await db.prepare(`
-      DELETE FROM monetag_reservations
-      WHERE telegram_id = ?
-      AND reservation_token = ?
-    `).bind(user.id, reservationToken).run();
 
     return jsonResponse({
       ok: true,
@@ -886,10 +882,6 @@ async function handleClaimReward(request, env) {
       throw new Error("Register your FaucetPay email first.");
     }
 
-    // Payout processing has intentionally not been enabled.
-    // Do not turn PAYOUTS_ENABLED on until payment processing,
-    // idempotency, and failure handling are implemented and tested.
-
     return jsonResponse({
       ok: false,
       error: "FaucetPay payout processing is not implemented yet."
@@ -901,4 +893,4 @@ async function handleClaimReward(request, env) {
       error: error.message
     }, 400);
   }
-}
+    }
