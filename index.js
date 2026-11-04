@@ -894,3 +894,1002 @@ async function handleClaimReward(request, env) {
     }, 400);
   }
     }
+
+// ==========================================
+// MONETAG REWARD COORDINATOR
+// READ-ONLY TEST VERSION
+// ==========================================
+export class MonetagRewardCoordinator {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const headers = {
+      "Content-Type": "application/json"
+    };
+
+    const respond = (data, status = 200) =>
+      new Response(JSON.stringify(data), {
+        status,
+        headers
+      });
+
+    if (request.method !== "POST") {
+      return respond({
+        ok: false,
+        error: "Method not allowed"
+      }, 405);
+    }
+
+    let data;
+
+    try {
+      data = await request.json();
+    } catch {
+      return respond({
+        ok: false,
+        error: "Invalid JSON"
+      }, 400);
+    }
+
+    // Preserve the existing read-only health check.
+    if (data.action === "health_check") {
+      return respond({
+        ok: true,
+        coordinator: "MonetagRewardCoordinator",
+        mode: "read_only",
+        message: "Coordinator is running. No rewards were credited."
+      });
+    }
+    // Securely bind one Monetag session to an active reservation.
+if (data.action === "bind_ymid") {
+  const userId = String(data.user_id || "");
+  const reservationToken = String(data.reservation_token || "");
+  const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !reservationToken ||
+    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID, reservation token, or session ID"
+    }, 400);
+  }
+
+  const reservationKey = `monetag:reservation:${userId}`;
+  const now = Date.now();
+
+  return await this.ctx.storage.transaction(async (txn) => {
+    const reservation = await txn.get(reservationKey);
+
+    if (
+      !reservation ||
+      reservation.token !== reservationToken ||
+      Number(reservation.expires_at || 0) <= now
+    ) {
+      return respond({
+        ok: false,
+        error: "Reservation is invalid or expired"
+      }, 409);
+    }
+
+    if (
+      reservation.ymid &&
+      reservation.ymid !== ymid
+    ) {
+      return respond({
+        ok: false,
+        error: "Reservation is already bound to another session"
+      }, 409);
+    }
+
+    await txn.put(reservationKey, {
+      ...reservation,
+      ymid: ymid,
+      bound_at: now
+    });
+
+    return respond({
+      ok: true,
+      bound: true,
+      reward_credited: false,
+      message: "Session bound to reservation. No reward was credited."
+    });
+  });
+  }
+        // Reserve one Monetag watch session without starting the cooldown.
+    if (data.action === "reserve_watch") {
+      const userId = String(data.user_id || "");
+
+      if (!/^\d{1,25}$/.test(userId)) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID"
+        }, 400);
+      }
+
+      const now = Date.now();
+      const cooldownKey = `monetag:last_watch:${userId}`;
+      const reservationKey = `monetag:reservation:${userId}`;
+      const reservationLifetimeMs = 10 * 60 * 1000;
+
+      return await this.ctx.storage.transaction(async (txn) => {
+        const lastRaw = await txn.get(cooldownKey);
+        const lastTime = Number(lastRaw || 0);
+        const remaining = Math.max(
+          0,
+          60 - Math.floor((now - lastTime) / 1000)
+        );
+
+        if (remaining > 0) {
+          return respond({
+            ok: true,
+            can_watch: false,
+            remaining_seconds: remaining,
+            message: "Cooldown is active."
+          });
+        }
+
+        const existing = await txn.get(reservationKey);
+
+        if (
+          existing &&
+          Number(existing.expires_at || 0) > now
+        ) {
+          return respond({
+            ok: true,
+            can_watch: false,
+            reservation_active: true,
+            message: "An advertisement session is already in progress."
+          });
+        }
+
+        const reservationToken = crypto.randomUUID();
+
+        await txn.put(reservationKey, {
+          token: reservationToken,
+          created_at: now,
+          expires_at: now + reservationLifetimeMs
+        });
+
+        return respond({
+          ok: true,
+          can_watch: true,
+          reservation_token: reservationToken,
+          message: "Watch session reserved. Cooldown has not started."
+        });
+      });
+    }
+
+    // Finish a reserved ad attempt and start the 60-second cooldown.
+    if (data.action === "finish_watch") {
+const userId = String(data.user_id || "");
+const reservationToken = String(data.reservation_token || "");
+
+if (
+!/^\d{1,25}$/.test(userId) ||
+!reservationToken
+) {
+return respond({
+ok: false,
+error: "Invalid user ID or reservation token",
+reward_credited: false
+}, 400);
+}
+
+const reservationKey = `monetag:reservation:${userId}`;
+const cooldownKey = `monetag:last_watch:${userId}`;
+const now = Date.now();
+
+return await this.ctx.storage.transaction(async (txn) => {
+const reservation = await txn.get(reservationKey);
+
+if (
+  !reservation ||
+  reservation.token !== reservationToken ||
+  Number(reservation.expires_at || 0) <= now ||
+  !reservation.ymid
+) {
+  return respond({
+    ok: false,
+    error: "Watch session is invalid, expired, or not registered",
+    reward_credited: false
+  }, 409);
+}
+
+const ymid = String(reservation.ymid);
+const attemptKey = `monetag:attempt:${ymid}`;
+const claimKey = `monetag:claim:${ymid}`;
+const verifiedKey = `monetag:verified:${ymid}`;
+
+const existingClaim = await txn.get(claimKey);
+
+const matchingPostback =
+  existingClaim &&
+  String(existingClaim.user_id) === userId &&
+  String(existingClaim.ymid) === ymid;
+
+await txn.put(attemptKey, {
+  user_id: userId,
+  ymid: ymid,
+  completed_at: now,
+  reward_claimed: false
+});
+
+if (matchingPostback) {
+  await txn.put(verifiedKey, {
+    user_id: userId,
+    ymid: ymid,
+    attempt_recorded: true,
+    valued_postback_recorded: true,
+    matched_at: now,
+    reward_eligible_for_review: true,
+    reward_credited: false
+  });
+}
+
+await txn.put(cooldownKey, now);
+await txn.delete(reservationKey);
+
+return respond({
+  ok: true,
+  cooldown_seconds: 60,
+  remaining_seconds: 60,
+  cooldown_started: true,
+  attempt_recorded: true,
+  postback_matched: Boolean(matchingPostback),
+  reward_eligible_for_review: Boolean(matchingPostback),
+  reward_credited: false,
+  message: matchingPostback
+    ? "Ad attempt and valued postback matched. No reward credited."
+    : "Ad attempt recorded. Waiting for a matching valued postback. No reward credited."
+});
+
+});
+  }
+
+    // Cancel a reserved session if the ad fails to open.
+    if (data.action === "cancel_watch") {
+      const userId = String(data.user_id || "");
+      const reservationToken = String(data.reservation_token || "");
+
+      if (
+        !/^\d{1,25}$/.test(userId) ||
+        !reservationToken
+      ) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID or reservation token"
+        }, 400);
+      }
+
+      const reservationKey = `monetag:reservation:${userId}`;
+
+      return await this.ctx.storage.transaction(async (txn) => {
+        const reservation = await txn.get(reservationKey);
+
+        if (!reservation || reservation.token !== reservationToken) {
+          return respond({
+            ok: false,
+            error: "Watch session is invalid or already closed"
+          }, 409);
+        }
+
+        await txn.delete(reservationKey);
+
+        return respond({
+          ok: true,
+          cancelled: true,
+          reward_credited: false,
+          message: "Watch reservation cancelled. No reward was credited."
+        });
+      });
+}
+    // Read-only Monetag cooldown check (60 seconds)
+if (data.action === "check_cooldown") {
+  const userId = String(data.user_id || "");
+  const now = Date.now();
+  const cooldownSeconds = 60;
+
+  if (!/^\d{1,25}$/.test(userId)) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID",
+      read_only: true
+    }, 400);
+  }
+
+  const lastKey = `monetag:last_watch:${userId}`;
+  const lastRaw = await this.ctx.storage.get(lastKey);
+  const lastTime = Number(lastRaw || 0);
+  const remaining = Math.max(
+    0,
+    cooldownSeconds - Math.floor((now - lastTime) / 1000)
+  );
+
+  return respond({
+    ok: true,
+    user_id: userId,
+    cooldown_seconds: cooldownSeconds,
+    remaining_seconds: remaining,
+    can_watch: remaining === 0,
+    read_only: true,
+    message: "Cooldown checked. No cooldown or reward data was changed."
+  });
+  }
+        // TEST ONLY: start a 60-second cooldown without crediting rewards
+    if (data.action === "test_start_cooldown") {
+      const userId = String(data.user_id || "");
+
+      if (!/^\d{1,25}$/.test(userId)) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID",
+          test_only: true
+        }, 400);
+      }
+
+      await this.ctx.storage.put(
+        `monetag:last_watch:${userId}`,
+        Date.now()
+      );
+
+      return respond({
+        ok: true,
+        user_id: userId,
+        cooldown_seconds: 60,
+        test_only: true,
+        reward_credited: false,
+        message: "Test cooldown started. No balance or reward was changed."
+      });
+        }
+    // Atomically check and start the 60-second cooldown.
+    // Atomically allow only one qualifying claim per Monetag session.
+// This records a claim only; it does not credit any reward.
+// TEMPORARY TEST: call the actual claim handler twice.
+// No reward is credited by this test.
+    if (data.action === "check_and_start_cooldown") {
+      const userId = String(data.user_id || "");
+
+      if (!/^\d{1,25}$/.test(userId)) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID"
+        }, 400);
+      }
+
+      const key = `monetag:last_watch:${userId}`;
+      const now = Date.now();
+      const cooldownSeconds = 60;
+
+      // Keep the read-and-write together to prevent concurrent requests
+      // from both passing the cooldown check.
+      return await this.ctx.storage.transaction(async (txn) => {
+        const lastRaw = await txn.get(key);
+        const lastTime = Number(lastRaw || 0);
+        const elapsedSeconds = Math.floor((now - lastTime) / 1000);
+        const remaining = Math.max(
+          0,
+          cooldownSeconds - elapsedSeconds
+        );
+
+        if (remaining > 0) {
+          return respond({
+            ok: true,
+            user_id: userId,
+            cooldown_seconds: cooldownSeconds,
+            remaining_seconds: remaining,
+            can_watch: false,
+            cooldown_started: false,
+            message: "Cooldown is active."
+          });
+        }
+
+        await txn.put(key, now);
+
+        return respond({
+          ok: true,
+          user_id: userId,
+          cooldown_seconds: cooldownSeconds,
+          remaining_seconds: cooldownSeconds,
+          can_watch: true,
+          cooldown_started: true,
+          message: "Cooldown started. No reward was credited."
+        });
+      });
+        }
+    // Validate supplied records without changing anything.
+    // Record one valued-event claim per Monetag session.
+// This action never credits a reward.
+if (data.action === "claim_valued_event") {
+const userId = String(data.user_id || "");
+const ymid = String(data.ymid || "");
+
+if (
+!/^\d{1,25}$/.test(userId) ||
+!/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+) {
+return respond({
+ok: false,
+error: "Invalid user ID or Monetag session ID",
+credited: false
+}, 400);
+}
+
+const claimKey = `monetag:claim:${ymid}`;
+const attemptKey = `monetag:attempt:${ymid}`;
+const verifiedKey = `monetag:verified:${ymid}`;
+
+return await this.ctx.storage.transaction(async (txn) => {
+const existing = await txn.get(claimKey);
+const attempt = await txn.get(attemptKey);
+
+if (existing && String(existing.user_id) !== userId) {
+  return respond({
+    ok: false,
+    error: "Session is already associated with another user",
+    credited: false
+  }, 403);
+}
+
+if (!existing) {
+  await txn.put(claimKey, {
+    user_id: userId,
+    ymid: ymid,
+    claimed_at: Date.now(),
+    credited: false
+  });
+}
+
+const matchingAttempt =
+  attempt &&
+  String(attempt.user_id) === userId &&
+  String(attempt.ymid) === ymid;
+
+if (matchingAttempt) {
+  await txn.put(verifiedKey, {
+    user_id: userId,
+    ymid: ymid,
+    attempt_recorded: true,
+    valued_postback_recorded: true,
+    matched_at: Date.now(),
+    reward_eligible_for_review: true,
+    reward_credited: false
+  });
+}
+
+return respond({
+  ok: true,
+  claimed: true,
+  duplicate: Boolean(existing),
+  attempt_matched: Boolean(matchingAttempt),
+  reward_eligible_for_review: Boolean(matchingAttempt),
+  credited: false,
+  message: matchingAttempt
+    ? "Valued postback matched with recorded ad attempt. No reward credited."
+    : "Valued postback recorded; waiting for matching ad attempt. No reward credited."
+});
+
+});
+}
+    // Atomically reserve a verified session for reward processing.
+// This action does not credit any balance.
+if (data.action === "reserve_reward_processing") {
+const userId = String(data.user_id || "");
+const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID or session ID",
+      reward_credited: false
+    }, 400);
+  }
+
+  const verifiedKey = `monetag:verified:${ymid}`;
+  const processingKey = `monetag:reward_processing:${ymid}`;
+
+  return await this.ctx.storage.transaction(async (txn) => {
+    const verified = await txn.get(verifiedKey);
+    const existing = await txn.get(processingKey);
+
+    if (
+      !verified ||
+      String(verified.user_id) !== userId ||
+      String(verified.ymid) !== ymid
+    ) {
+      return respond({
+        ok: false,
+        reserved: false,
+        error: "Verified Monetag session not found",
+        reward_credited: false
+      }, 403);
+    }
+
+    if (existing) {
+      return respond({
+        ok: true,
+        reserved: false,
+        duplicate: true,
+        status: existing.status,
+        reward_credited: false,
+        message: "This session already has a reward-processing record."
+      });
+    }
+
+    const now = Date.now();
+
+    await txn.put(processingKey, {
+      user_id: userId,
+      ymid: ymid,
+      status: "reserved",
+      reserved_at: now,
+      reward_credited: false
+    });
+
+    return respond({
+      ok: true,
+      reserved: true,
+      duplicate: false,
+      status: "reserved",
+      reward_credited: false,
+      message: "Reward processing reserved. No balance was changed."
+    });
+  });
+}
+    if (data.action === "authorize_reward_credit") {
+  const userId = String(data.user_id || "");
+  const ymid = String(data.ymid || "");
+
+  if (!userId || !ymid) {
+    return Response.json({
+      ok: false,
+      error: "Missing user_id or ymid."
+    }, { status: 400 });
+  }
+
+  const result = await this.ctx.storage.transaction(async (txn) => {
+    const verified = await txn.get("monetag:verified:" + ymid);
+    const processing = await txn.get(
+      "monetag:reward_processing:" + ymid
+    );
+
+    if (!verified || String(verified.user_id) !== userId) {
+      return {
+        ok: false,
+        authorized: false,
+        error: "Verified session not found for this user."
+      };
+    }
+
+    if (!processing || String(processing.user_id) !== userId) {
+      return {
+        ok: false,
+        authorized: false,
+        error: "Reward processing reservation not found."
+      };
+    }
+
+    if (processing.status !== "reserved") {
+      return {
+        ok: true,
+        authorized: false,
+        duplicate: true,
+        status: processing.status,
+        reward_credited: false,
+        message: "This session has already moved beyond the reserved stage."
+      };
+    }
+
+    const now = Date.now();
+
+    processing.status = "crediting";
+    processing.amount = 0.001;
+    processing.currency = "USD";
+    processing.credit_authorized_at = now;
+    processing.reward_credited = false;
+
+    await txn.put(
+      "monetag:reward_processing:" + ymid,
+      processing
+    );
+
+    return {
+      ok: true,
+      authorized: true,
+      duplicate: false,
+      status: "crediting",
+      amount: 0.001,
+      currency: "USD",
+      reward_credited: false,
+      message: "One credit attempt authorized. No balance was changed."
+    };
+  });
+
+  return Response.json(result);
+  }
+    // TEST ONLY: Safely finalize a reserved reward-processing record.
+// This action never credits a balance.
+if (data.action === "finalize_reward_processing_test") {
+  const userId = String(data.user_id || "");
+  const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !/^ra_[A-Za-z0-9_-]{1,120}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID or session ID",
+      reward_credited: false
+    }, 400);
+  }
+
+  const verifiedKey = `monetag:verified:${ymid}`;
+  const processingKey = `monetag:reward_processing:${ymid}`;
+
+  return await this.ctx.storage.transaction(async (txn) => {
+    const verified = await txn.get(verifiedKey);
+    const processing = await txn.get(processingKey);
+
+    if (
+      !verified ||
+      String(verified.user_id) !== userId ||
+      !processing ||
+      String(processing.user_id) !== userId
+    ) {
+      return respond({
+        ok: false,
+        finalized: false,
+        error: "Matching verified session or processing record not found",
+        reward_credited: false
+      }, 403);
+    }
+
+    if (processing.status === "test_finalized") {
+      return respond({
+        ok: true,
+        finalized: false,
+        duplicate: true,
+        status: "test_finalized",
+        reward_credited: false
+      });
+    }
+
+    if (processing.status !== "reserved") {
+      return respond({
+        ok: false,
+        finalized: false,
+        error: "Processing record is not in reserved status",
+        reward_credited: false
+      }, 409);
+    }
+
+    const now = Date.now();
+
+    await txn.put(processingKey, {
+      ...processing,
+      status: "test_finalized",
+      finalized_at: now,
+      reward_credited: false
+    });
+
+    return respond({
+      ok: true,
+      finalized: true,
+      duplicate: false,
+      status: "test_finalized",
+      reward_credited: false,
+      message: "Test processing finalized. No balance was changed."
+    });
+  });
+          }
+    // TEST ONLY: Recover an interrupted reward-processing reservation.
+// This action never credits a balance.
+if (data.action === "recover_reward_processing_test") {
+  const userId = String(data.user_id || "");
+  const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !/^ra_[A-Za-z0-9_-]{1,120}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      recovered: false,
+      error: "Invalid user ID or session ID",
+      reward_credited: false
+    }, 400);
+  }
+
+  const verifiedKey = `monetag:verified:${ymid}`;
+  const processingKey = `monetag:reward_processing:${ymid}`;
+
+  return await this.ctx.storage.transaction(async (txn) => {
+    const verified = await txn.get(verifiedKey);
+    const processing = await txn.get(processingKey);
+
+    if (
+      !verified ||
+      String(verified.user_id) !== userId ||
+      !processing ||
+      String(processing.user_id) !== userId
+    ) {
+      return respond({
+        ok: false,
+        recovered: false,
+        error: "Matching verified session or processing record not found",
+        reward_credited: false
+      }, 403);
+    }
+
+    if (processing.status === "test_recovered") {
+      return respond({
+        ok: true,
+        recovered: false,
+        duplicate: true,
+        status: "test_recovered",
+        reward_credited: false
+      });
+    }
+
+    if (processing.status !== "reserved") {
+      return respond({
+        ok: false,
+        recovered: false,
+        error: "Only reserved records can be recovered",
+        status: processing.status,
+        reward_credited: false
+      }, 409);
+    }
+
+    const now = Date.now();
+
+    await txn.put(processingKey, {
+      ...processing,
+      status: "test_recovered",
+      recovered_at: now,
+      reward_credited: false
+    });
+
+    return respond({
+      ok: true,
+      recovered: true,
+      duplicate: false,
+      status: "test_recovered",
+      reward_credited: false,
+      message: "Test reservation recovered. No balance was changed."
+    });
+  });
+      }
+   if (data.action === "inspect_session") {
+  const userId = String(data.user_id || "");
+  const ymid = String(data.ymid || "");
+
+  if (
+    !/^\d{1,25}$/.test(userId) ||
+    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+  ) {
+    return respond({
+      ok: false,
+      error: "Invalid user ID or session ID",
+      read_only: true
+    }, 400);
+  }
+
+  const attempt = await this.ctx.storage.get(
+    `monetag:attempt:${ymid}`
+  );
+
+  const claim = await this.ctx.storage.get(
+    `monetag:claim:${ymid}`
+  );
+
+  const verified = await this.ctx.storage.get(
+    `monetag:verified:${ymid}`
+  );
+
+  return respond({
+    ok: true,
+    ymid: ymid,
+    user_id: userId,
+    attempt_found: Boolean(attempt),
+    claim_found: Boolean(claim),
+    verified_found: Boolean(verified),
+    attempt_matches_user: Boolean(
+      attempt && String(attempt.user_id) === userId
+    ),
+    claim_matches_user: Boolean(
+      claim && String(claim.user_id) === userId
+    ),
+    verified_matches_user: Boolean(
+      verified && String(verified.user_id) === userId
+    ),
+    reward_credited: false,
+    read_only: true
+  });
+    }
+        if (data.action === "inspect_reward_processing") {
+      const userId = String(data.user_id || "");
+      const ymid = String(data.ymid || "");
+
+      if (
+        !/^\d{1,25}$/.test(userId) ||
+        !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+      ) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID or session ID",
+          read_only: true
+        }, 400);
+      }
+
+      const verified = await this.ctx.storage.get(
+        `monetag:verified:${ymid}`
+      );
+
+      const processing = await this.ctx.storage.get(
+        `monetag:reward_processing:${ymid}`
+      );
+
+      if (
+        !verified ||
+        String(verified.user_id) !== userId ||
+        !processing ||
+        String(processing.user_id) !== userId
+      ) {
+        return respond({
+          ok: false,
+          found: false,
+          error: "Matching verified processing record not found",
+          read_only: true
+        });
+      }
+
+      return respond({
+        ok: true,
+        found: true,
+        user_id: userId,
+        ymid: ymid,
+        status: processing.status,
+        amount: processing.amount || 0,
+        currency: processing.currency || "USD",
+        reward_credited: processing.reward_credited === true,
+        credit_authorized_at:
+          processing.credit_authorized_at || null,
+        read_only: true
+      });
+      }
+        if (data.action === "claim_credit_execution_test") {
+      const userId = String(data.user_id || "");
+      const ymid = String(data.ymid || "");
+
+      if (
+        !/^\d{1,25}$/.test(userId) ||
+        !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
+      ) {
+        return respond({
+          ok: false,
+          error: "Invalid user ID or session ID",
+          test_only: true
+        }, 400);
+      }
+
+      const result = await this.ctx.storage.transaction(async (txn) => {
+        const processing = await txn.get(
+          `monetag:reward_processing:${ymid}`
+        );
+
+        if (!processing || String(processing.user_id) !== userId) {
+          return {
+            ok: false,
+            permitted: false,
+            error: "Matching processing record not found."
+          };
+        }
+
+        if (processing.status !== "crediting") {
+          return {
+            ok: true,
+            permitted: false,
+            duplicate: true,
+            status: processing.status,
+            message: "This session cannot receive another execution permit."
+          };
+        }
+
+        processing.status = "test_permit_issued";
+        processing.test_permit_issued_at = Date.now();
+        processing.reward_credited = false;
+
+        await txn.put(
+          `monetag:reward_processing:${ymid}`,
+          processing
+        );
+
+        return {
+          ok: true,
+          permitted: true,
+          duplicate: false,
+          status: "test_permit_issued",
+          amount: processing.amount,
+          currency: processing.currency,
+          reward_credited: false,
+          message: "Test permit issued. No balance was changed."
+        };
+      });
+
+      return respond({
+        ...result,
+        test_only: true
+      });
+  }
+    if (data.action === "validate_event") {
+      const session = data.session;
+      const event = data.event;
+
+      if (
+        !session ||
+        !event ||
+        typeof session !== "object" ||
+        typeof event !== "object"
+      ) {
+        return respond({
+          ok: false,
+          valid: false,
+          error: "Session and event records are required",
+          read_only: true
+        }, 400);
+      }
+
+      const sameUser =
+        String(session.user_id || "") !== "" &&
+        String(session.user_id) === String(event.user_id || "");
+
+      const sameYmid =
+        String(session.ymid || "") !== "" &&
+        String(session.ymid) === String(event.ymid || "");
+
+      const valuedEvent =
+        event.reward_event_type === "valued" &&
+        event.reward_eligible === true;
+
+      const notCredited =
+        event.credited === false;
+
+      const valid =
+        sameUser &&
+        sameYmid &&
+        valuedEvent &&
+        notCredited;
+
+      return respond({
+        ok: true,
+        valid: valid,
+        checks: {
+          session_user_matches_event: sameUser,
+          session_ymid_matches_event: sameYmid,
+          valued_event_is_eligible: valuedEvent,
+          event_not_already_credited: notCredited
+        },
+        read_only: true,
+        message: valid
+          ? "Event passed preliminary validation. No reward was credited."
+          : "Event failed one or more validation checks. No reward was credited."
+      });
+    }
+
+    return respond({
+      ok: false,
+      error: "Unsupported action",
+      read_only: true
+    }, 400);
+  }
+  }
