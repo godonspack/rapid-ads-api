@@ -1,4189 +1,904 @@
+// ============================================================
+// RAPID ADS API
+// Fresh Cloudflare Worker
+// ============================================================
+
+const CONFIG = {
+  APP_NAME: "Rapid Ads",
+
+  MONETAG_ZONE_ID: "12109194",
+  MONETAG_REWARD_UNITS: 50000,
+  MONETAG_REWARD_CURRENCY: "USDT",
+  MONETAG_COOLDOWN_SECONDS: 60,
+  MONETAG_DAILY_LIMIT: 100,
+  MONETAG_RESERVATION_SECONDS: 600,
+
+  FAUCETPAY_API_BASE: "https://faucetpay.io/api/v2",
+
+  TELEGRAM_AUTH_MAX_AGE: 86400,
+
+  // Keep disabled until real payout processing is implemented
+  // and tested.
+  PAYOUTS_ENABLED: false
+};
+
+// ============================================================
+// MAIN WORKER
+// ============================================================
+
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-
-    const headers = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store"
-    };
-
-    const respond = (data, status = 200) =>
-      new Response(JSON.stringify(data), {
-        status,
-        headers
-      });
-
-    // Handle browser preflight requests.
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers
-      });
-    }
-
-    // ==========================================
-    // 1. HEALTH CHECK
-    // ==========================================
-    if (
-      url.pathname === "/health" &&
-      request.method === "GET"
-    ) {
-      let telegramBot = {
-        checked: false,
-        valid: false,
-        message: "Telegram bot token is not configured"
-      };
-
-      if (env.TELEGRAM_BOT_TOKEN) {
-        try {
-          const telegramResponse = await fetch(
-            "https://api.telegram.org/bot" +
-              env.TELEGRAM_BOT_TOKEN +
-              "/getMe"
-          );
-
-          const telegramResult =
-            await telegramResponse.json();
-
-          telegramBot = telegramResult.ok
-            ? {
-                checked: true,
-                valid: true,
-                username:
-                  telegramResult.result.username
-              }
-            : {
-                checked: true,
-                valid: false,
-                message:
-                  "Telegram rejected the configured token"
-              };
-        } catch {
-          telegramBot = {
-            checked: true,
-            valid: false,
-            message: "Could not contact Telegram"
-          };
-        }
-      }
-
-      return respond({
-        ok: true,
-        service: "Rapid Ads API",
-        status: "running",
-        balanceStorageConfigured: Boolean(
-          env.RAPID_ADS_BALANCES
-        ),
-        secretConfigured: Boolean(
-          env.TBC_API_SECRET
-        ),
-        telegramBotTokenConfigured: Boolean(
-          env.TELEGRAM_BOT_TOKEN
-        ),
-        telegramBot
-      });
-    }
-// ==========================================
-// REQUEST LIVE TBC BALANCE
-// ==========================================
-if (
-  url.pathname === "/balance-request" &&
-  request.method === "POST"
-) {
-  if (
-    !env.TELEGRAM_BOT_TOKEN ||
-    !env.TBC_TEST_WEBHOOK_URL ||
-    !env.RAPID_ADS_BALANCES
-  ) {
-    return respond({
-      ok: false,
-      error: "Server configuration incomplete"
-    }, 503);
-  }
-
-  let data;
-
-  try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON"
-    }, 400);
-  }
-
-  const initData = data.initData;
-
-  if (
-    typeof initData !== "string" ||
-    initData.length === 0 ||
-    initData.length > 10000
-  ) {
-    return respond({
-      ok: false,
-      error: "Missing Telegram authentication data"
-    }, 400);
-  }
-
-  try {
-    const params = new URLSearchParams(initData);
-    const receivedHash = params.get("hash");
-    const authDate = Number(params.get("auth_date"));
-    const userJson = params.get("user");
-
-    if (
-      !receivedHash ||
-      !/^[a-f0-9]{64}$/i.test(receivedHash) ||
-      !Number.isSafeInteger(authDate) ||
-      !userJson
-    ) {
-      return respond({
-        ok: false,
-        error: "Invalid Telegram authentication data"
-      }, 401);
-    }
-
-    const now = Math.floor(Date.now() / 1000);
-
-    if (
-      authDate > now + 60 ||
-      now - authDate > 86400
-    ) {
-      return respond({
-        ok: false,
-        error: "Telegram authentication has expired"
-      }, 401);
-    }
-
-    params.delete("hash");
-
-    const dataCheckString = [...params.entries()]
-      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
-      .map(([key, value]) => `${key}=${value}`)
-      .join("\n");
-
-    const encoder = new TextEncoder();
-
-    const keyMaterial = await crypto.subtle.importKey(
-      "raw",
-      encoder.encode("WebAppData"),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"]
-    );
-
-    const secretBytes = await crypto.subtle.sign(
-      "HMAC",
-      keyMaterial,
-      encoder.encode(env.TELEGRAM_BOT_TOKEN)
-    );
-
-    const secretKey = await crypto.subtle.importKey(
-      "raw",
-      secretBytes,
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"]
-    );
-
-    const hashBytes = await crypto.subtle.sign(
-      "HMAC",
-      secretKey,
-      encoder.encode(dataCheckString)
-    );
-
-    const calculatedHash = Array.from(new Uint8Array(hashBytes))
-      .map(byte => byte.toString(16).padStart(2, "0"))
-      .join("");
-
-    const expectedHash = receivedHash.toLowerCase();
-
-    let difference = 0;
-
-    for (let i = 0; i < calculatedHash.length; i++) {
-      difference |=
-        calculatedHash.charCodeAt(i) ^
-        expectedHash.charCodeAt(i);
-    }
-
-    if (difference !== 0) {
-      return respond({
-        ok: false,
-        error: "Telegram authentication failed"
-      }, 401);
-    }
-
-    let telegramUser;
-
     try {
-      telegramUser = JSON.parse(userJson);
-    } catch {
-      return respond({
-        ok: false,
-        error: "Invalid Telegram user data"
-      }, 401);
-    }
+      const url = new URL(request.url);
+      const path = url.pathname;
 
-    const userId = String(telegramUser.id ?? "");
-
-    if (!/^\d{1,20}$/.test(userId)) {
-      return respond({
-        ok: false,
-        error: "Invalid Telegram user ID"
-      }, 401);
-    }
-
-    const requestId = crypto.randomUUID();
-    const pendingKey = `pending-balance:${requestId}`;
-    const expiresAt = Date.now() + 120000;
-
-    await env.RAPID_ADS_BALANCES.put(
-      pendingKey,
-      JSON.stringify({
-        request_id: requestId,
-        user_id: userId,
-        expires_at: expiresAt
-      }),
-      { expirationTtl: 120 }
-    );
-
-    let webhookResponse;
-
-    try {
-      webhookResponse = await fetch(
-        env.TBC_TEST_WEBHOOK_URL,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            request_id: requestId,
-            user_id: userId
-          })
-        }
-      );
-    } catch (error) {
-      await env.RAPID_ADS_BALANCES.delete(pendingKey);
-      throw error;
-    }
-
-    if (!webhookResponse.ok) {
-      await env.RAPID_ADS_BALANCES.delete(pendingKey);
-
-      return respond({
-        ok: false,
-        error: "Telebot Creator request failed",
-        upstream_status: webhookResponse.status
-      }, 502);
-    }
-
-    return respond({
-      ok: true,
-      request_id: requestId,
-      expires_in_seconds: 120,
-      message: "Balance request sent"
-    });
-  } catch (error) {
-    console.error("Balance request failed:", error);
-
-    return respond({
-      ok: false,
-      error: "Could not start balance request"
-    }, 500);
-  }
-        }
-    // ==========================================
-    // 2. GET BALANCE FOR AUTHENTICATED MINI APP
-    // ==========================================
-    if (
-      url.pathname === "/balance" &&
-      request.method === "POST"
-    ) {
-      if (
-        !env.TELEGRAM_BOT_TOKEN ||
-        !env.RAPID_ADS_BALANCES
-      ) {
-        return respond({
-          ok: false,
-          error: "Server configuration incomplete"
-        }, 503);
-      }
-
-      let data;
-
-      try {
-        data = await request.json();
-      } catch {
-        return respond({
-          ok: false,
-          error: "Invalid JSON"
-        }, 400);
-      }
-
-      const initData = data.initData;
-
-      if (
-        typeof initData !== "string" ||
-        initData.length === 0 ||
-        initData.length > 10000
-      ) {
-        return respond({
-          ok: false,
-          error:
-            "Missing or invalid Telegram authentication data"
-        }, 400);
-      }
-
-      try {
-        const params = new URLSearchParams(initData);
-
-        const receivedHash = params.get("hash");
-        const authDate = Number(
-          params.get("auth_date")
-        );
-        const userJson = params.get("user");
-
-        // Check the required authentication fields.
-        if (
-          !receivedHash ||
-          !/^[a-f0-9]{64}$/i.test(receivedHash) ||
-          !Number.isSafeInteger(authDate) ||
-          !userJson
-        ) {
-          return respond({
-            ok: false,
-            error:
-              "Invalid Telegram authentication data"
-          }, 401);
-        }
-
-        // Reject authentication data older than 24 hours
-        // or dated more than 60 seconds into the future.
-        const now = Math.floor(Date.now() / 1000);
-
-        if (
-          authDate > now + 60 ||
-          now - authDate > 86400
-        ) {
-          return respond({
-            ok: false,
-            error:
-              "Telegram authentication has expired. Reopen the Mini App."
-          }, 401);
-        }
-
-        // Build the data-check string.
-        // Exclude the hash and sort the remaining fields.
-        params.delete("hash");
-
-        const dataCheckString = [...params.entries()]
-          .sort(([a], [b]) => {
-            if (a < b) return -1;
-            if (a > b) return 1;
-            return 0;
-          })
-          .map(
-            ([key, value]) => `${key}=${value}`
-          )
-          .join("\n");
-
-        const encoder = new TextEncoder();
-
-        // IMPORTANT:
-        // Telegram's Web App authentication algorithm:
-        //
-        // secret_key =
-        // HMAC_SHA256(key="WebAppData", message=bot_token)
-        //
-        // calculated_hash =
-        // HMAC_SHA256(key=secret_key, message=data_check_string)
-
-        const secretKeyMaterial =
-          await crypto.subtle.importKey(
-            "raw",
-            encoder.encode("WebAppData"),
-            {
-              name: "HMAC",
-              hash: "SHA-256"
-            },
-            false,
-            ["sign"]
-          );
-
-        const secretKeyBytes =
-          await crypto.subtle.sign(
-            "HMAC",
-            secretKeyMaterial,
-            encoder.encode(env.TELEGRAM_BOT_TOKEN)
-          );
-
-        const secretKey =
-          await crypto.subtle.importKey(
-            "raw",
-            secretKeyBytes,
-            {
-              name: "HMAC",
-              hash: "SHA-256"
-            },
-            false,
-            ["sign"]
-          );
-
-        const calculatedHashBytes =
-          await crypto.subtle.sign(
-            "HMAC",
-            secretKey,
-            encoder.encode(dataCheckString)
-          );
-
-        const calculatedHash = Array.from(
-          new Uint8Array(calculatedHashBytes)
-        )
-          .map(byte =>
-            byte.toString(16).padStart(2, "0")
-          )
-          .join("");
-
-        const normalizedReceivedHash =
-          receivedHash.toLowerCase();
-
-        // Reject a hash that does not match.
-        if (
-          calculatedHash.length !==
-          normalizedReceivedHash.length
-        ) {
-          return respond({
-            ok: false,
-            error: "Telegram authentication failed"
-          }, 401);
-        }
-
-        // Compare the hashes.
-        let difference = 0;
-
-        for (
-          let i = 0;
-          i < calculatedHash.length;
-          i++
-        ) {
-          difference |=
-            calculatedHash.charCodeAt(i) ^
-            normalizedReceivedHash.charCodeAt(i);
-        }
-
-        if (difference !== 0) {
-          return respond({
-            ok: false,
-            error: "Telegram authentication failed"
-          }, 401);
-        }
-
-        // Parse the verified Telegram user.
-        let telegramUser;
-
-        try {
-          telegramUser = JSON.parse(userJson);
-        } catch {
-          return respond({
-            ok: false,
-            error: "Invalid Telegram user data"
-          }, 401);
-        }
-
-        const userId = String(
-          telegramUser.id ?? ""
-        );
-
-        if (
-          !/^\d+$/.test(userId) ||
-          userId.length > 20
-        ) {
-          return respond({
-            ok: false,
-            error: "Invalid Telegram user ID"
-          }, 401);
-        }
-
-        // Only the authenticated Telegram user ID
-        // can be used to look up a balance.
-        const savedRecord =
-          await env.RAPID_ADS_BALANCES.get(
-            `user:${userId}`
-          );
-
-        if (!savedRecord) {
-          return respond({
-            ok: true,
-            user_id: userId,
-            balance: null,
-            synced: false,
-            message:
-              "No saved balance exists yet. Open the bot and use /balance first."
-          });
-        }
-
-        let record;
-
-        try {
-          record = JSON.parse(savedRecord);
-        } catch {
-          return respond({
-            ok: false,
-            error: "Saved balance record is invalid"
-          }, 500);
-        }
-
-        if (
-          String(record.user_id) !== userId ||
-          typeof record.balance !== "number" ||
-          !Number.isFinite(record.balance) ||
-          record.balance < 0
-        ) {
-          return respond({
-            ok: false,
-            error: "Saved balance record is invalid"
-          }, 500);
-        }
-
-        return respond({
-          ok: true,
-          user_id: userId,
-          balance: record.balance,
-          synced: true,
-          updated_at: record.updated_at
+      if (request.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: corsHeaders()
         });
-      } catch {
-        return respond({
-          ok: false,
-          error:
-            "Authentication or storage operation failed"
-        }, 500);
-      }
-    }
-
-    // ==========================================
-    // 3. SYNCHRONIZE BALANCE FROM TELEBOT CREATOR
-    // ==========================================
-    if (
-      url.pathname === "/sync-balance" &&
-      request.method === "POST"
-    ) {
-      if (
-        !env.TBC_API_SECRET ||
-        !env.RAPID_ADS_BALANCES
-      ) {
-        return respond({
-          ok: false,
-          error: "Server configuration incomplete"
-        }, 503);
       }
 
-      const authorization =
-        request.headers.get("Authorization");
-
-      if (
-        !authorization ||
-        authorization !==
-          `Bearer ${env.TBC_API_SECRET}`
-      ) {
-        return respond({
-          ok: false,
-          error: "Unauthorized"
-        }, 401);
-      }
-
-      let data;
-
-      try {
-        data = await request.json();
-      } catch {
-        return respond({
-          ok: false,
-          error: "Invalid JSON"
-        }, 400);
-      }
-
-      const userId = String(
-        data.user_id ?? ""
-      );
-
-      const balance = Number(data.balance);
-
-      if (
-        !/^\d+$/.test(userId) ||
-        userId.length > 20
-      ) {
-        return respond({
-          ok: false,
-          error: "Invalid user ID"
-        }, 400);
-      }
-
-      if (
-        data.balance === null ||
-        data.balance === undefined ||
-        data.balance === "" ||
-        !Number.isFinite(balance) ||
-        balance < 0 ||
-        balance > 1000000000
-      ) {
-        return respond({
-          ok: false,
-          error: "Invalid balance"
-        }, 400);
-      }
-
-      const record = {
-        user_id: userId,
-        balance: Number(balance.toFixed(8)),
-        updated_at: new Date().toISOString()
-      };
-
-      try {
-        await env.RAPID_ADS_BALANCES.put(
-          `user:${userId}`,
-          JSON.stringify(record)
-        );
-
-        return respond({
+      if (path === "/health" && request.method === "GET") {
+        return jsonResponse({
           ok: true,
-          message: "Balance snapshot saved",
-          user_id: userId
+          service: CONFIG.APP_NAME,
+          status: "online",
+          payouts_enabled: CONFIG.PAYOUTS_ENABLED,
+          timestamp: new Date().toISOString()
         });
-      } catch {
-        return respond({
-          ok: false,
-          error: "Storage operation failed"
-        }, 500);
-      }
-    }
-        // ==========================================
-    // 4. REGISTER MONETAG ADVERTISEMENT SESSION
-    // ==========================================
-    if (
-      url.pathname === "/monetag-register" &&
-      request.method === "POST"
-    ) {
-      if (
-  !env.TELEGRAM_BOT_TOKEN ||
-  !env.RAPID_ADS_BALANCES ||
-  !env.MONETAG_REWARD_COORDINATOR
-) {
-        return respond({
-          ok: false,
-          error: "Server configuration incomplete"
-        }, 503);
       }
 
-      let data;
-
-      try {
-        data = await request.json();
-      } catch {
-        return respond({
-          ok: false,
-          error: "Invalid JSON"
-        }, 400);
-      }
-
-      const initData = data.initData;
-const ymid = data.ymid;
-const reservationToken = data.reservation_token;
-
-      if (
-  typeof initData !== "string" ||
-  initData.length === 0 ||
-  initData.length > 10000 ||
-  typeof ymid !== "string" ||
-  !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid) ||
-  typeof reservationToken !== "string" ||
-  reservationToken.length === 0 ||
-  reservationToken.length > 200
-) {
-  return respond({
-    ok: false,
-    error: "Invalid registration data"
-  }, 400);
-      }
-
-      try {
-        // Verify Telegram Mini App authentication.
-        const params = new URLSearchParams(initData);
-        const receivedHash = params.get("hash");
-        const authDate = Number(params.get("auth_date"));
-        const userJson = params.get("user");
-
-        if (
-          !receivedHash ||
-          !/^[a-f0-9]{64}$/i.test(receivedHash) ||
-          !Number.isSafeInteger(authDate) ||
-          !userJson
-        ) {
-          return respond({
-            ok: false,
-            error: "Invalid Telegram authentication data"
-          }, 401);
-        }
-
-        const now = Math.floor(Date.now() / 1000);
-
-        if (
-          authDate > now + 60 ||
-          now - authDate > 86400
-        ) {
-          return respond({
-            ok: false,
-            error: "Telegram authentication has expired. Reopen the Mini App."
-          }, 401);
-        }
-
-        params.delete("hash");
-
-        const dataCheckString = [...params.entries()]
-          .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
-          .map(([key, value]) => `${key}=${value}`)
-          .join("\n");
-
-        const encoder = new TextEncoder();
-
-        const secretKeyMaterial =
-          await crypto.subtle.importKey(
-            "raw",
-            encoder.encode("WebAppData"),
-            {
-              name: "HMAC",
-              hash: "SHA-256"
-            },
-            false,
-            ["sign"]
-          );
-
-        const secretKeyBytes =
-          await crypto.subtle.sign(
-            "HMAC",
-            secretKeyMaterial,
-            encoder.encode(env.TELEGRAM_BOT_TOKEN)
-          );
-
-        const secretKey =
-          await crypto.subtle.importKey(
-            "raw",
-            secretKeyBytes,
-            {
-              name: "HMAC",
-              hash: "SHA-256"
-            },
-            false,
-            ["sign"]
-          );
-
-        const calculatedHashBytes =
-          await crypto.subtle.sign(
-            "HMAC",
-            secretKey,
-            encoder.encode(dataCheckString)
-          );
-
-        const calculatedHash = Array.from(
-          new Uint8Array(calculatedHashBytes)
-        )
-          .map(byte => byte.toString(16).padStart(2, "0"))
-          .join("");
-
-        const normalizedHash = receivedHash.toLowerCase();
-
-        if (calculatedHash.length !== normalizedHash.length) {
-          return respond({
-            ok: false,
-            error: "Telegram authentication failed"
-          }, 401);
-        }
-
-        let difference = 0;
-
-        for (let i = 0; i < calculatedHash.length; i++) {
-          difference |=
-            calculatedHash.charCodeAt(i) ^
-            normalizedHash.charCodeAt(i);
-        }
-
-        if (difference !== 0) {
-          return respond({
-            ok: false,
-            error: "Telegram authentication failed"
-          }, 401);
-        }
-
-        let telegramUser;
-
-        try {
-          telegramUser = JSON.parse(userJson);
-        } catch {
-          return respond({
-            ok: false,
-            error: "Invalid Telegram user data"
-          }, 401);
-        }
-
-        const userId = String(telegramUser.id ?? "");
-
-        if (
-          !/^\d+$/.test(userId) ||
-          userId.length > 20
-        ) {
-          return respond({
-            ok: false,
-            error: "Invalid Telegram user ID"
-          }, 401);
-      }
-// Verify and bind the authenticated user's reservation.
-const coordinatorId =
-  env.MONETAG_REWARD_COORDINATOR.idFromName(
-    "cooldown:" + userId
-  );
-
-const coordinator =
-  env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
-
-const bindingResponse = await coordinator.fetch(
-  "https://coordinator.internal/",
-  {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      action: "bind_ymid",
-      user_id: userId,
-      reservation_token: reservationToken,
-      ymid: ymid
-    })
-  }
-);
-
-let bindingResult;
-
-try {
-  bindingResult = await bindingResponse.json();
-} catch {
-  return respond({
-    ok: false,
-    error: "Could not verify advertisement reservation"
-  }, 502);
-}
-
-if (
-  !bindingResponse.ok ||
-  bindingResult.ok !== true ||
-  bindingResult.bound !== true
-) {
-  return respond({
-    ok: false,
-    error: "Advertisement reservation could not be verified"
-  }, 409);
-}
-        // Do not overwrite an existing session ID.
-        const sessionKey = `monetag:session:${ymid}`;
-        const existing =
-          await env.RAPID_ADS_BALANCES.get(sessionKey);
-
-        if (existing) {
-          return respond({
-            ok: false,
-            error: "This advertisement session already exists"
-          }, 409);
-        }
-
-        const session = {
-          user_id: userId,
-          ymid: ymid,
-          created_at: new Date().toISOString(),
-          credited: false
-        };
-
-        await env.RAPID_ADS_BALANCES.put(
-          sessionKey,
-          JSON.stringify(session),
-          { expirationTtl: 7200 }
-        );
-
-        return respond({
+      if (path === "/" && request.method === "GET") {
+        return jsonResponse({
           ok: true,
-          registered: true,
-          message: "Advertisement session registered"
+          service: CONFIG.APP_NAME,
+          message: "Rapid Ads API is running."
         });
-
-      } catch (error) {
-        console.error("Monetag registration error:", error);
-
-        return respond({
-          ok: false,
-          error: "Could not register advertisement session"
-        }, 500);
       }
-    }
-    // ==========================================
-    // 4. MONETAG POSTBACK — VERIFICATION ONLY
-    // ==========================================
-    if (
-  url.pathname === "/monetag-postback" &&
-  request.method === "GET"
-) {
-  if (
-  !env.MONETAG_POSTBACK_SECRET ||
-  !env.RAPID_ADS_BALANCES ||
-  !env.MONETAG_REWARD_COORDINATOR
-) {
-  return respond({
-    ok: false,
-    error: "Server configuration incomplete"
-  }, 503);
-  }
 
-  // 1. Verify the private postback secret.
-  const suppliedSecret = url.searchParams.get("secret");
+      if (path === "/faucetpay-email" && request.method === "POST") {
+        return await handleFaucetPayEmail(request, env);
+      }
 
-  if (
-    !suppliedSecret ||
-    suppliedSecret !== env.MONETAG_POSTBACK_SECRET
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized"
-    }, 403);
-  }
+      if (path === "/monetag-cooldown-start" && request.method === "POST") {
+        return await handleMonetagCooldown(request, env);
+      }
 
-  // 2. Read the notification details.
-  const ymid = url.searchParams.get("ymid");
-  const rewardType =
-    url.searchParams.get("reward_event_type");
-  const eventType =
-    url.searchParams.get("event_type");
-  const zoneId = url.searchParams.get("zone_id");
-  const telegramId =
-    url.searchParams.get("telegram_id");
-  const requestVar =
-    url.searchParams.get("request_var");
+      if (path === "/monetag-register" && request.method === "POST") {
+        return await handleMonetagRegister(request, env);
+      }
 
-  // 3. Validate the session ID.
-  if (
-    !ymid ||
-    ymid.length > 200 ||
-    !/^[a-zA-Z0-9_-]+$/.test(ymid)
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid ymid"
-    }, 400);
-  }
+      if (path === "/monetag-postback" && request.method === "GET") {
+        return await handleMonetagPostback(request, env);
+      }
 
-  // 4. Accept only the expected ad zone and values.
-  if (
-    zoneId !== "12109194" ||
-    !["valued", "non_valued"].includes(rewardType) ||
-    !["impression", "click"].includes(eventType) ||
-    requestVar !== "rapid_ads_watch"
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid postback parameters"
-    }, 400);
-  }
+      if (path === "/payment-history" && request.method === "POST") {
+        return await handlePaymentHistory(request, env);
+      }
 
-  try {
-    // 5. Find the session created by the Mini App.
-    const sessionKey = `monetag:session:${ymid}`;
-    const sessionText =
-      await env.RAPID_ADS_BALANCES.get(sessionKey);
+      if (path === "/claim-reward" && request.method === "POST") {
+        return await handleClaimReward(request, env);
+      }
 
-    if (!sessionText) {
-      return respond({
+      return jsonResponse({
         ok: false,
-        error: "Advertisement session not found or expired"
+        error: "Route not found."
       }, 404);
-    }
 
-    let session;
+    } catch (error) {
+      console.error("Worker error:", error);
 
-    try {
-      session = JSON.parse(sessionText);
-    } catch {
-      return respond({
+      return jsonResponse({
         ok: false,
-        error: "Invalid stored session"
+        error: "Internal server error."
       }, 500);
     }
-
-    // 6. Confirm the notification belongs to this session.
-    if (
-      !session.user_id ||
-      String(session.user_id) !== String(telegramId) ||
-      String(session.ymid) !== String(ymid)
-    ) {
-      return respond({
-        ok: false,
-        error: "Session user verification failed"
-      }, 403);
-    }
-    // 7. Allow only one qualifying valued-event claim per Monetag session.
-// This records a claim only; it does not credit any reward.
-if (rewardType === "valued") {
-  const coordinatorId =
-    env.MONETAG_REWARD_COORDINATOR.idFromName(
-      "cooldown:" + String(session.user_id)
-    );
-
-  const coordinator =
-    env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
-
-  const claimResponse = await coordinator.fetch(
-    "https://coordinator.internal/",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        action: "claim_valued_event",
-        user_id: String(session.user_id),
-        ymid: ymid
-      })
-    }
-  );
-
-  const claimResult = await claimResponse.json();
-  if (!claimResponse.ok || claimResult.ok !== true) {
-    return respond({
-      ok: false,
-      credited: false,
-      error: "Could not safely validate the Monetag claim."
-    }, 502);
   }
+};
 
-  if (claimResult.claimed !== true) {
-    return respond({
-      ok: true,
-      duplicate: true,
-      reward_eligible: false,
-      credited: false,
-      message: "This Monetag session has already claimed its valued event."
-    });
+// ============================================================
+// RESPONSE HELPERS
+// ============================================================
+
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Content-Type": "application/json"
+  };
+}
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: corsHeaders()
+  });
+}
+
+async function readJson(request) {
+  try {
+    return await request.json();
+  } catch {
+    return null;
   }
 }
 
-// 8. Record the event separately by event and reward type.
-    // This allows a non-valued event to arrive before a valued event.
-    const eventKey =
-      `monetag:event:${ymid}:${eventType}:${rewardType}`;
+function unixTime() {
+  return Math.floor(Date.now() / 1000);
+}
 
-    const existing =
-      await env.RAPID_ADS_BALANCES.get(eventKey);
+function utcDateKey() {
+  return new Date().toISOString().slice(0, 10);
+}
 
-    if (existing) {
-      return respond({
+function randomId(prefix = "ra") {
+  return prefix + "_" + crypto.randomUUID();
+}
+
+function timingSafeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") {
+    return false;
+  }
+
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  let result = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+
+  return result === 0;
+}
+
+// ============================================================
+// TELEGRAM AUTHENTICATION
+// ============================================================
+
+async function hmacSha256(key, message) {
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    key,
+    {
+      name: "HMAC",
+      hash: "SHA-256"
+    },
+    false,
+    ["sign"]
+  );
+
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    cryptoKey,
+    new TextEncoder().encode(message)
+  );
+
+  return new Uint8Array(signature);
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes)
+    .map(byte => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function verifyTelegramInitData(initData, botToken) {
+  if (!initData || !botToken) {
+    throw new Error("Telegram authentication data is missing.");
+  }
+
+  const params = new URLSearchParams(initData);
+  const receivedHash = params.get("hash");
+
+  if (!receivedHash || !/^[a-f0-9]{64}$/i.test(receivedHash)) {
+    throw new Error("Invalid Telegram authentication hash.");
+  }
+
+  params.delete("hash");
+
+  const entries = Array.from(params.entries())
+    .sort(([a], [b]) => a.localeCompare(b));
+
+  const dataCheckString = entries
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
+
+  const secretKey = await hmacSha256(
+    new TextEncoder().encode("WebAppData"),
+    botToken
+  );
+
+  const calculatedHash = bytesToHex(
+    await hmacSha256(secretKey, dataCheckString)
+  );
+
+  if (!timingSafeEqual(
+    calculatedHash.toLowerCase(),
+    receivedHash.toLowerCase()
+  )) {
+    throw new Error("Telegram authentication failed.");
+  }
+
+  const authDate = Number(params.get("auth_date"));
+  const now = unixTime();
+
+  if (
+    !Number.isFinite(authDate) ||
+    authDate > now + 60 ||
+    now - authDate > CONFIG.TELEGRAM_AUTH_MAX_AGE
+  ) {
+    throw new Error("Telegram session has expired. Reopen the Mini App.");
+  }
+
+  let user;
+
+  try {
+    user = JSON.parse(params.get("user") || "null");
+  } catch {
+    throw new Error("Invalid Telegram user information.");
+  }
+
+  if (!user || !Number.isSafeInteger(user.id) || user.id <= 0) {
+    throw new Error("Invalid Telegram user ID.");
+  }
+
+  return {
+    id: String(user.id),
+    first_name: String(user.first_name || ""),
+    username: String(user.username || "")
+  };
+}
+
+// ============================================================
+// DATABASE AND AUTHENTICATED REQUESTS
+// ============================================================
+
+function getDatabase(env) {
+  if (!env.RAPID_ADS_DB) {
+    throw new Error("RAPID_ADS_DB database binding is missing.");
+  }
+
+  return env.RAPID_ADS_DB;
+}
+
+async function authenticateRequest(request, env) {
+  const body = await readJson(request);
+
+  if (!body || typeof body.initData !== "string") {
+    throw new Error("Telegram initData is required.");
+  }
+
+  const user = await verifyTelegramInitData(
+    body.initData,
+    env.TELEGRAM_BOT_TOKEN
+  );
+
+  return { body, user };
+}
+
+function validFaucetPayEmail(email) {
+  if (typeof email !== "string" || email.length > 254) {
+    return false;
+  }
+
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+}
+
+async function registerFaucetPayEmail(db, user, email) {
+  if (!validFaucetPayEmail(email)) {
+    throw new Error("Enter a valid FaucetPay email address.");
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+
+  await db.prepare(`
+    INSERT INTO users (
+      telegram_id,
+      faucetpay_email,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(telegram_id)
+    DO UPDATE SET
+      faucetpay_email = excluded.faucetpay_email,
+      updated_at = excluded.updated_at
+  `).bind(
+    user.id,
+    normalizedEmail,
+    unixTime(),
+    unixTime()
+  ).run();
+
+  return {
+    registered: true,
+    faucetpay_email: normalizedEmail
+  };
+}
+
+async function getRegisteredUser(db, telegramId) {
+  return await db.prepare(`
+    SELECT telegram_id, faucetpay_email, created_at
+    FROM users
+    WHERE telegram_id = ?
+  `).bind(telegramId).first();
+}
+
+// ============================================================
+// FAUCETPAY EMAIL REGISTRATION
+// ============================================================
+
+async function handleFaucetPayEmail(request, env) {
+  try {
+    const { body, user } = await authenticateRequest(request, env);
+    const db = getDatabase(env);
+
+    const result = await registerFaucetPayEmail(
+      db,
+      user,
+      body.faucetpay_email
+    );
+
+    return jsonResponse({
+      ok: true,
+      ...result
+    });
+
+  } catch (error) {
+    return jsonResponse({
+      ok: false,
+      error: error.message
+    }, 400);
+  }
+}
+
+// ============================================================
+// MONETAG COOLDOWN AND DAILY LIMIT
+// ============================================================
+
+async function getMonetagDailyCount(db, telegramId) {
+  const daily = await db.prepare(`
+    SELECT COUNT(*) AS total
+    FROM monetag_sessions
+    WHERE telegram_id = ?
+    AND date(created_at, 'unixepoch') = ?
+  `).bind(
+    telegramId,
+    utcDateKey()
+  ).first();
+
+  return Number(daily?.total || 0);
+}
+
+async function getMonetagCooldown(db, telegramId) {
+  const latest = await db.prepare(`
+    SELECT finished_at
+    FROM monetag_cooldowns
+    WHERE telegram_id = ?
+  `).bind(telegramId).first();
+
+  if (!latest) {
+    return 0;
+  }
+
+  return Math.max(
+    0,
+    CONFIG.MONETAG_COOLDOWN_SECONDS -
+    (unixTime() - Number(latest.finished_at))
+  );
+}
+
+async function handleMonetagCooldown(request, env) {
+  try {
+    const { body, user } = await authenticateRequest(request, env);
+    const db = getDatabase(env);
+
+    const action = String(body.action || "check_cooldown");
+    const now = unixTime();
+
+    // --------------------------------------------------------
+    // CANCEL A RESERVATION
+    // --------------------------------------------------------
+
+    if (action === "cancel_watch") {
+      const token = String(body.reservation_token || "");
+
+      if (!token) {
+        throw new Error("Reservation token is required.");
+      }
+
+      const result = await db.prepare(`
+        DELETE FROM monetag_reservations
+        WHERE telegram_id = ?
+        AND reservation_token = ?
+      `).bind(user.id, token).run();
+
+      return jsonResponse({
         ok: true,
-        duplicate: true,
-        credited: false,
-        message: "This notification was already recorded"
+        cancelled: Number(result.meta?.changes || 0) > 0
       });
     }
 
-    const record = {
-      ymid: ymid,
-      user_id: String(session.user_id),
-      event_type: eventType,
-      reward_event_type: rewardType,
-      zone_id: zoneId,
-      request_var: requestVar,
-      received_at: new Date().toISOString(),
-      reward_eligible: false,
-      credited: false
-    };
+    // --------------------------------------------------------
+    // FINISH A WATCH ATTEMPT
+    // --------------------------------------------------------
 
-    await env.RAPID_ADS_BALANCES.put(
-      eventKey,
-      JSON.stringify(record),
-      { expirationTtl: 604800 }
-    );
+    if (action === "finish_watch") {
+      const token = String(body.reservation_token || "");
+      const ymid = String(body.ymid || "");
 
-    return respond({
-  ok: true,
-  recorded: true,
-  reward_eligible: false,
-  credited: false,
-  message: "Monetag notification recorded. Reward eligibility must be confirmed through session matching."
-});
+      if (!token || !ymid) {
+        throw new Error("Reservation token and session ID are required.");
+      }
 
-  } catch (error) {
-    console.error("Monetag postback processing failed:", error);
+      const session = await db.prepare(`
+        SELECT id, status
+        FROM monetag_sessions
+        WHERE telegram_id = ?
+        AND ymid = ?
+      `).bind(user.id, ymid).first();
 
-    return respond({
-      ok: false,
-      error: "Could not process notification"
-    }, 500);
-  }
+      if (!session) {
+        throw new Error("Monetag session not found.");
+      }
+
+      // A completed session cannot be completed again.
+      const existingCooldown = await db.prepare(`
+        SELECT finished_at
+        FROM monetag_cooldowns
+        WHERE telegram_id = ?
+        AND session_id = ?
+      `).bind(user.id, session.id).first();
+
+      if (existingCooldown) {
+        const remaining = Math.max(
+          0,
+          CONFIG.MONETAG_COOLDOWN_SECONDS -
+          (now - Number(existingCooldown.finished_at))
+        );
+
+        return jsonResponse({
+          ok: true,
+          cooldown_started: true,
+          cooldown_seconds: CONFIG.MONETAG_COOLDOWN_SECONDS,
+          remaining_seconds: remaining,
+          attempt_recorded: true,
+          reward_credited: false,
+          reward_eligible_for_review: session.status === "VERIFIED"
+        });
+      }
+
+      const reservation = await db.prepare(`
+        SELECT reservation_token, expires_at
+        FROM monetag_reservations
+        WHERE telegram_id = ?
+      `).bind(user.id).first();
+
+      if (
+        !reservation ||
+        reservation.reservation_token !== token ||
+        Number(reservation.expires_at) < now
+      ) {
+        throw new Error("Reservation is invalid or expired.");
+      }
+
+      await db.prepare(`
+        INSERT INTO monetag_cooldowns (
+          telegram_id,
+          session_id,
+          finished_at
+        )
+        VALUES (?, ?, ?)
+      `).bind(
+        user.id,
+        session.id,
+        now
+      ).run();
+
+      await db.prepare(`
+        DELETE FROM monetag_reservations
+        WHERE telegram_id = ?
+        AND reservation_token = ?
+      `).bind(user.id, token).run();
+
+      return jsonResponse({
+        ok: true,
+        cooldown_started: true,
+        cooldown_seconds: CONFIG.MONETAG_COOLDOWN_SECONDS,
+        remaining_seconds: CONFIG.MONETAG_COOLDOWN_SECONDS,
+        attempt_recorded: true,
+        reward_credited: false,
+        reward_eligible_for_review: session.status === "VERIFIED"
+      });
     }
-    // ==========================================
-// TBC BALANCE RESULT CALLBACK — READ ONLY
-// ==========================================
-if (
-  url.pathname === "/tbc-balance-result" &&
-  request.method === "POST"
-) {
-  if (
-    !env.TBC_API_SECRET ||
-    !env.RAPID_ADS_BALANCES
-  ) {
-    return respond({
-      ok: false,
-      error: "Server configuration incomplete"
-    }, 503);
-  }
 
-  if (
-    request.headers.get("Authorization") !==
-    `Bearer ${env.TBC_API_SECRET}`
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized"
-    }, 401);
-  }
+    if (action !== "check_cooldown" && action !== "reserve_watch") {
+      throw new Error("Unsupported Monetag action.");
+    }
 
-  let data;
+    // --------------------------------------------------------
+    // CHECK USER REGISTRATION
+    // --------------------------------------------------------
 
-  try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON"
-    }, 400);
-  }
+    const registeredUser = await getRegisteredUser(db, user.id);
 
-  const requestId = String(data.request_id || "");
-  const userId = String(data.user_id || "");
-  const balance = data.balance;
-
-  if (
-    !/^[a-zA-Z0-9_-]{16,100}$/.test(requestId) ||
-    !/^\d{1,20}$/.test(userId) ||
-    typeof balance !== "number" ||
-    !Number.isFinite(balance) ||
-    balance < 0 ||
-    balance > 1000000000
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid balance result"
-    }, 400);
-  }
-
-  const pendingKey = `pending-balance:${requestId}`;
-  const resultKey = `balance-result:${requestId}`;
-
-  try {
-    const pending =
-      await env.RAPID_ADS_BALANCES.get(
-        pendingKey,
-        "json"
-      );
-
-    if (
-      !pending ||
-      String(pending.user_id) !== userId ||
-      pending.request_id !== requestId ||
-      typeof pending.expires_at !== "number" ||
-      pending.expires_at <= Date.now()
-    ) {
-      return respond({
+    if (!registeredUser?.faucetpay_email) {
+      return jsonResponse({
         ok: false,
-        error: "No matching valid pending request"
+        registered: false,
+        can_watch: false,
+        error: "Register your FaucetPay email before watching ads."
       }, 403);
     }
 
-    const existing =
-      await env.RAPID_ADS_BALANCES.get(resultKey);
+    // --------------------------------------------------------
+    // CHECK COOLDOWN AND DAILY LIMIT
+    // --------------------------------------------------------
 
-    if (existing) {
-      return respond({
+    const remaining = await getMonetagCooldown(db, user.id);
+    const dailyCount = await getMonetagDailyCount(db, user.id);
+
+    const dailyRemaining = Math.max(
+      0,
+      CONFIG.MONETAG_DAILY_LIMIT - dailyCount
+    );
+
+    if (action === "check_cooldown") {
+      return jsonResponse({
+        ok: true,
+        can_watch: remaining === 0 && dailyRemaining > 0,
+        remaining_seconds: remaining,
+        daily_count: dailyCount,
+        daily_remaining: dailyRemaining
+      });
+    }
+
+    if (remaining > 0) {
+      return jsonResponse({
+        ok: true,
+        can_watch: false,
+        remaining_seconds: remaining
+      });
+    }
+
+    if (dailyRemaining <= 0) {
+      return jsonResponse({
         ok: false,
-        error: "Request already has a result"
+        can_watch: false,
+        error: "Daily Monetag limit reached."
+      }, 429);
+    }
+
+    // --------------------------------------------------------
+    // CREATE A SINGLE RESERVATION
+    // --------------------------------------------------------
+
+    const existingReservation = await db.prepare(`
+      SELECT reservation_token, expires_at
+      FROM monetag_reservations
+      WHERE telegram_id = ?
+    `).bind(user.id).first();
+
+    if (
+      existingReservation &&
+      Number(existingReservation.expires_at) >= now
+    ) {
+      return jsonResponse({
+        ok: false,
+        can_watch: false,
+        error: "A watch reservation is already active."
       }, 409);
     }
 
-    const result = {
-      request_id: requestId,
-      user_id: userId,
-      balance: Number(balance.toFixed(8)),
-      received_at: new Date().toISOString(),
-      read_only: true
-    };
+    // Remove only an expired reservation.
+    await db.prepare(`
+      DELETE FROM monetag_reservations
+      WHERE telegram_id = ?
+      AND expires_at < ?
+    `).bind(user.id, now).run();
 
-    await env.RAPID_ADS_BALANCES.put(
-      resultKey,
-      JSON.stringify(result),
-      { expirationTtl: 300 }
-    );
+    const token = randomId("reservation");
 
-    await env.RAPID_ADS_BALANCES.delete(pendingKey);
-
-    return respond({
-      ok: true,
-      received: true,
-      read_only: true
-    });
-  } catch (error) {
-    console.error(
-      "TBC balance callback failed:",
-      error
-    );
-
-    return respond({
-      ok: false,
-      error: "Could not validate or save balance result"
-    }, 500);
-  }
-      }
-// ==========================================
-// TEST: SEND JSON TO TELEBOT CREATOR
-// ==========================================
-if (
-url.pathname === "/tbc-test" &&
-request.method === "POST"
-) {
-if (!env.TBC_TEST_WEBHOOK_URL) {
-return respond({
-ok: false,
-error: "TBC test webhook secret is not configured"
-}, 503);
-}
-
-const authorization = request.headers.get("Authorization");
-
-if (
-!env.TBC_API_SECRET ||
-authorization !== `Bearer ${env.TBC_API_SECRET}`
-) {
-return respond({
-ok: false,
-error: "Unauthorized"
-}, 401);
-}
-
-let data;
-
-try {
-data = await request.json();
-} catch {
-return respond({
-ok: false,
-error: "Invalid JSON"
-}, 400);
-}
-
-const testId = String(data.test_id || "");
-
-if (testId !== "rapid-ads-tbc-connection-test") {
-return respond({
-ok: false,
-error: "Invalid test identifier"
-}, 400);
-}
-
-try {
-const tbcResponse = await fetch(
-env.TBC_TEST_WEBHOOK_URL,
-{
-method: "POST",
-headers: {
-"Content-Type": "application/json"
-},
-body: JSON.stringify({
-source: "Rapid Ads Cloudflare Worker",
-test_id: testId,
-test_only: true,
-reward_crediting: false
-})
-}
-);
-
-const responseText = await tbcResponse.text();
-
-console.log("TBC TEST HTTP STATUS:", tbcResponse.status);
-console.log("TBC TEST RESPONSE:", responseText.slice(0, 500));
-
-return respond({
-  ok: tbcResponse.ok,
-  test_only: true,
-  tbc_http_status: tbcResponse.status,
-  tbc_response: responseText.slice(0, 500),
-  message: tbcResponse.ok
-    ? "TBC webhook request sent"
-    : "TBC webhook returned an error"
-}, tbcResponse.ok ? 200 : 502);
-
-} catch (error) {
-console.error("TBC test webhook failed:", error);
-
-return respond({
-  ok: false,
-  error: "Could not contact TBC webhook"
-}, 502);
-
-}
-}
-    // ==========================================
-    // 5. HANDLE OTHER REQUESTS
-    // ==========================================
-    // ==========================================
-    // 4. HANDLE OTHER REQUESTS
-    // ==========================================
-    // ==========================================
-// TBC BALANCE RESULT CHECK — PROTECTED TEST
-// ==========================================
-if (url.pathname === "/tbc-balance-result-check") {
-if (request.method !== "POST") {
-return respond({
-ok: false,
-error: "Method not allowed"
-}, 405);
-}
-
-  if (
-    !env.TBC_API_SECRET ||
-    request.headers.get("Authorization") !==
-      "Bearer " + env.TBC_API_SECRET
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized"
-    }, 401);
-  }
-
-  const body = await request.json();
-  const requestId = body.request_id;
-
-  if (
-    typeof requestId !== "string" ||
-    !/^[a-zA-Z0-9_-]{16,100}$/.test(requestId)
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid request_id"
-    }, 400);
-  }
-
-  const result = await env.RAPID_ADS_BALANCES.get(
-    "balance-result:" + requestId,
-    "json"
-  );
-
-  if (!result) {
-return respond({
-ok: false,
-error: "No saved result found",
-request_id: requestId
-}, 200);
-  }
-
-  return respond({
-    ok: true,
-    result: result
-  });
-}
-// ==========================================
-// SECURE MINI APP BALANCE RESULT CHECK
-// ==========================================
-if (
-  url.pathname === "/balance-result" &&
-  request.method === "POST"
-) {
-  if (
-    !env.TELEGRAM_BOT_TOKEN ||
-    !env.RAPID_ADS_BALANCES
-  ) {
-    return respond({
-      ok: false,
-      error: "Server configuration incomplete"
-    }, 503);
-  }
-
-  let data;
-
-  try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON"
-    }, 400);
-  }
-
-  const initData = data.initData;
-  const requestId = String(data.request_id || "");
-
-  if (
-    typeof initData !== "string" ||
-    !initData ||
-    initData.length > 10000 ||
-    !/^[a-zA-Z0-9_-]{16,100}$/.test(requestId)
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid request"
-    }, 400);
-  }
-
-  try {
-    const params = new URLSearchParams(initData);
-    const receivedHash = params.get("hash");
-    const authDate = Number(params.get("auth_date"));
-    const userJson = params.get("user");
-
-    if (
-      !receivedHash ||
-      !/^[a-f0-9]{64}$/i.test(receivedHash) ||
-      !Number.isSafeInteger(authDate) ||
-      !userJson
-    ) {
-      return respond({
-        ok: false,
-        error: "Invalid Telegram authentication"
-      }, 401);
-    }
-
-    const now = Math.floor(Date.now() / 1000);
-
-    if (authDate > now + 60 || now - authDate > 86400) {
-      return respond({
-        ok: false,
-        error: "Telegram authentication expired"
-      }, 401);
-    }
-
-    params.delete("hash");
-
-    const dataCheckString = [...params.entries()]
-      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
-      .map(([key, value]) => `${key}=${value}`)
-      .join("\n");
-
-    const encoder = new TextEncoder();
-
-    const keyMaterial = await crypto.subtle.importKey(
-      "raw",
-      encoder.encode("WebAppData"),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"]
-    );
-
-    const secretBytes = await crypto.subtle.sign(
-      "HMAC",
-      keyMaterial,
-      encoder.encode(env.TELEGRAM_BOT_TOKEN)
-    );
-
-    const secretKey = await crypto.subtle.importKey(
-      "raw",
-      secretBytes,
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"]
-    );
-
-    const hashBytes = await crypto.subtle.sign(
-      "HMAC",
-      secretKey,
-      encoder.encode(dataCheckString)
-    );
-
-    const calculatedHash = Array.from(new Uint8Array(hashBytes))
-      .map(byte => byte.toString(16).padStart(2, "0"))
-      .join("");
-
-    const expectedHash = receivedHash.toLowerCase();
-    let difference = 0;
-
-    for (let i = 0; i < calculatedHash.length; i++) {
-      difference |=
-        calculatedHash.charCodeAt(i) ^
-        expectedHash.charCodeAt(i);
-    }
-
-    if (difference !== 0) {
-      return respond({
-        ok: false,
-        error: "Telegram authentication failed"
-      }, 401);
-    }
-
-    let telegramUser;
-
-    try {
-      telegramUser = JSON.parse(userJson);
-    } catch {
-      return respond({
-        ok: false,
-        error: "Invalid Telegram user data"
-      }, 401);
-    }
-
-    const userId = String(telegramUser.id ?? "");
-
-    if (!/^\d{1,20}$/.test(userId)) {
-      return respond({
-        ok: false,
-        error: "Invalid Telegram user ID"
-      }, 401);
-    }
-
-    const result = await env.RAPID_ADS_BALANCES.get(
-      `balance-result:${requestId}`,
-      "json"
-    );
-
-    if (!result) {
-      return respond({
-        ok: true,
-        ready: false,
-        message: "Balance result is not available yet"
-      });
-    }
-
-    if (String(result.user_id) !== userId) {
-      return respond({
-        ok: false,
-        error: "This result does not belong to your account"
-      }, 403);
-    }
-
-    return respond({
-      ok: true,
-      ready: true,
-      user_id: userId,
-      balance: result.balance,
-      read_only: true
-    });
-  } catch (error) {
-    console.error("Balance result check failed:", error);
-
-    return respond({
-      ok: false,
-      error: "Could not check balance result"
-    }, 500);
-  }
-}
-// ==========================================
-// END SECURE MINI APP BALANCE RESULT CHECK
-// ==========================================
-// ==========================================
-// END PROTECTED BALANCE RESULT CHECK
-// ==========================================
-// ==========================================
-// MONETAG WEBHOOK TEST — READ ONLY
-// ==========================================
-if (request.method === "POST" && url.pathname === "/tbc-monetag-webhook-test") {
-  try {
-    const auth = request.headers.get("Authorization") || "";
-
-    if (!env.TBC_API_SECRET || auth !== `Bearer ${env.TBC_API_SECRET}`) {
-      return respond({ ok: false, error: "Unauthorized" }, 401);
-    }
-
-    const body = await request.json();
-
-    const userId = String(body.user_id || "");
-    const webhookUrl = String(body.webhook_url || "");
-
-    if (
-      body.test_id !== "rapid-ads-monetag-webhook-test" ||
-      !/^\d+$/.test(userId) ||
-      !webhookUrl
-    ) {
-      return respond({
-        ok: false,
-        error: "Invalid test request"
-      }, 400);
-    }
-
-    const parsedUrl = new URL(webhookUrl);
-
-    if (
-      parsedUrl.protocol !== "https:" ||
-      !(
-        parsedUrl.hostname === "telebotcreator.com" ||
-        parsedUrl.hostname.endsWith(".telebotcreator.com")
+    await db.prepare(`
+      INSERT INTO monetag_reservations (
+        telegram_id,
+        reservation_token,
+        expires_at,
+        created_at
       )
-    ) {
-      return respond({
-        ok: false,
-        error: "Webhook URL host is not allowed"
-      }, 400);
-    }
+      VALUES (?, ?, ?, ?)
+    `).bind(
+      user.id,
+      token,
+      now + CONFIG.MONETAG_RESERVATION_SECONDS,
+      now
+    ).run();
 
-    const requestId = crypto.randomUUID();
-
-    const webhookResponse = await fetch(webhookUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        user_id: userId,
-        request_id: requestId,
-        ymid: "test_" + requestId
-      })
-    });
-
-    const responseText = await webhookResponse.text();
-
-    return respond({
-      ok: webhookResponse.ok,
-      target_user_id: userId,
-      webhook_http_status: webhookResponse.status,
-      request_id: requestId,
-      response_preview: responseText.slice(0, 500),
-      read_only: true,
-      balance_credited: false
-    }, 200);
-
-  } catch (error) {
-    return respond({
-      ok: false,
-      error: String(error),
-      read_only: true,
-      balance_credited: false
-    }, 500);
-  }
-}
-// ==========================================
-// END MONETAG WEBHOOK TEST
-// ==========================================   
-    // ==========================================
-// TEMPORARY MONETAG EVENT CHECK — READ ONLY
-// ==========================================
-if (
-  url.pathname === "/monetag-check" &&
-  request.method === "POST"
-) {
-  if (
-    !env.TBC_API_SECRET ||
-    !env.RAPID_ADS_BALANCES
-  ) {
-    return respond({
-      ok: false,
-      error: "Server configuration incomplete"
-    }, 503);
-  }
-
-  if (
-    request.headers.get("Authorization") !==
-    "Bearer " + env.TBC_API_SECRET
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized"
-    }, 401);
-  }
-
-  let data;
-
-  try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON"
-    }, 400);
-  }
-
-  const ymid = String(data.ymid || "");
-
-  if (!/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)) {
-    return respond({
-      ok: false,
-      error: "Invalid ymid"
-    }, 400);
-  }
-
-  try {
-    const session = await env.RAPID_ADS_BALANCES.get(
-      "monetag:session:" + ymid,
-      "json"
-    );
-
-    const events = [];
-
-    for (const eventType of ["impression", "click"]) {
-      for (const rewardType of ["valued", "non_valued"]) {
-        const key =
-          "monetag:event:" +
-          ymid + ":" +
-          eventType + ":" +
-          rewardType;
-
-        const record =
-          await env.RAPID_ADS_BALANCES.get(key, "json");
-
-        if (record) {
-          events.push({
-  user_id: String(record.user_id || ""),
-  event_type: record.event_type,
-  reward_event_type: record.reward_event_type,
-  reward_eligible: record.reward_eligible,
-  credited: record.credited,
-  received_at: record.received_at
-});
-        }
-      }
-    }
-
-    return respond({
+    return jsonResponse({
       ok: true,
-      ymid: ymid,
-      session_found: Boolean(session),
-      session_user_matches_events: session
-  ? events.every(
-      event => String(event.user_id) === String(session.user_id)
-    )
-  : false,
-      event_count: events.length,
-      events: events,
-      read_only: true,
-      message: "Diagnostic completed. No balance changed."
-    });
-  } catch (error) {
-    console.error("Monetag diagnostic failed:", error);
-
-    return respond({
-      ok: false,
-      error: "Could not read Monetag diagnostic records"
-    }, 500);
-  }
-}
-// ==========================================
-// END TEMPORARY MONETAG EVENT CHECK
-// ==========================================
-    // ==========================================
-// MONETAG COORDINATOR HEALTH CHECK — READ ONLY
-// ==========================================
-if (
-  url.pathname === "/monetag-coordinator-health" &&
-  request.method === "POST"
-) {
-  if (
-    !env.TBC_API_SECRET ||
-    !env.MONETAG_REWARD_COORDINATOR
-  ) {
-    return respond({
-      ok: false,
-      error: "Coordinator binding or API secret is missing"
-    }, 503);
-  }
-
-  if (
-    request.headers.get("Authorization") !==
-    "Bearer " + env.TBC_API_SECRET
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized"
-    }, 401);
-  }
-
-  let data;
-
-  try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON"
-    }, 400);
-  }
-
-  if (data.test_id !== "rapid-ads-coordinator-health-test") {
-    return respond({
-      ok: false,
-      error: "Invalid test identifier"
-    }, 400);
-  }
-
-  try {
-    const coordinatorId =
-      env.MONETAG_REWARD_COORDINATOR.idFromName(
-        "rapid-ads-health-check"
-      );
-
-    const coordinator =
-      env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
-
-    const coordinatorResponse = await coordinator.fetch(
-      "https://coordinator.internal/",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          action: "health_check"
-        })
-      }
-    );
-
-    const responseText =
-      await coordinatorResponse.text();
-
-    let coordinatorResult;
-
-    try {
-      coordinatorResult = JSON.parse(responseText);
-    } catch {
-      coordinatorResult = {
-        message: "Coordinator returned an invalid response"
-      };
-    }
-
-    return respond({
-      ok: coordinatorResponse.ok,
-      coordinator_http_status: coordinatorResponse.status,
-      coordinator_result: coordinatorResult,
-      read_only: true,
-      message: coordinatorResponse.ok
-        ? "Coordinator health check completed. No rewards were credited."
-        : "Coordinator responded with an error."
-    }, coordinatorResponse.ok ? 200 : 502);
-
-  } catch (error) {
-    console.error("Coordinator health check failed:", error);
-
-    return respond({
-      ok: false,
-      error: "Could not contact the reward coordinator",
-      read_only: true
-    }, 502);
-  }
-}
-    // ==========================================
-// MONETAG COOLDOWN CHECK — READ ONLY
-// ==========================================
-if (
-  url.pathname === "/monetag-cooldown-check" &&
-  request.method === "POST"
-) {
-  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
-    return respond({
-      ok: false,
-      error: "Required API configuration is missing",
-      read_only: true
-    }, 503);
-  }
-
-  if (
-    request.headers.get("Authorization") !==
-    "Bearer " + env.TBC_API_SECRET
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized",
-      read_only: true
-    }, 401);
-  }
-
-  let data;
-
-  try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON",
-      read_only: true
-    }, 400);
-  }
-
-  const userId = String(data.user_id || "");
-
-  if (!/^\d{1,25}$/.test(userId)) {
-    return respond({
-      ok: false,
-      error: "Invalid user ID",
-      read_only: true
-    }, 400);
-  }
-
-  try {
-    const coordinatorId =
-      env.MONETAG_REWARD_COORDINATOR.idFromName(
-        "cooldown:" + userId
-      );
-
-    const coordinator =
-      env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
-
-    const coordinatorResponse = await coordinator.fetch(
-      "https://coordinator.internal/",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          action: "check_cooldown",
-          user_id: userId
-        })
-      }
-    );
-
-    const result = await coordinatorResponse.json();
-
-    return respond({
-      ok: coordinatorResponse.ok,
-      coordinator_http_status: coordinatorResponse.status,
-      result: result,
-      read_only: true,
-      message: "Cooldown check completed. No rewards were credited."
-    }, coordinatorResponse.ok ? 200 : 502);
-
-  } catch (error) {
-    console.error("Monetag cooldown check failed:", error);
-
-    return respond({
-      ok: false,
-      error: "Cooldown check failed",
-      read_only: true
-    }, 500);
-  }
-}
-    // ==========================================
-// MONETAG COOLDOWN START — TEST ONLY
-// ==========================================
-if (
-  url.pathname === "/monetag-cooldown-start-test" &&
-  request.method === "POST"
-) {
-  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
-    return respond({
-      ok: false,
-      error: "Required API configuration is missing",
-      test_only: true
-    }, 503);
-  }
-
-  if (
-    request.headers.get("Authorization") !==
-    "Bearer " + env.TBC_API_SECRET
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized",
-      test_only: true
-    }, 401);
-  }
-
-  let data;
-
-  try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON",
-      test_only: true
-    }, 400);
-  }
-
-  const userId = String(data.user_id || "");
-
-  if (!/^\d{1,25}$/.test(userId)) {
-    return respond({
-      ok: false,
-      error: "Invalid user ID",
-      test_only: true
-    }, 400);
-  }
-
-  try {
-    const coordinatorId =
-      env.MONETAG_REWARD_COORDINATOR.idFromName(
-        "cooldown:" + userId
-      );
-
-    const coordinator =
-      env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
-
-    const coordinatorResponse = await coordinator.fetch(
-      "https://coordinator.internal/",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-  action: "test_start_cooldown",
-user_id: userId
-})
-      }
-    );
-
-    const result = await coordinatorResponse.json();
-
-    return respond({
-      ok: coordinatorResponse.ok,
-      coordinator_http_status: coordinatorResponse.status,
-      result: result,
-      test_only: true,
-      message: "Test cooldown started. No rewards were credited."
-    }, coordinatorResponse.ok ? 200 : 502);
-
-  } catch (error) {
-    console.error("Monetag test cooldown start failed:", error);
-
-    return respond({
-      ok: false,
-      error: "Test cooldown start failed",
-      test_only: true
-    }, 500);
-  }
-    }
-    // ==========================================
-// MONETAG COOLDOWN ENFORCEMENT
-// ==========================================
-if (
-  url.pathname === "/monetag-cooldown-start" &&
-  request.method === "POST"
-) {
-  if (
-    !env.TELEGRAM_BOT_TOKEN ||
-    !env.MONETAG_REWARD_COORDINATOR
-  ) {
-    return respond({
-      ok: false,
-      error: "Required API configuration is missing"
-    }, 503);
-  }
-
-  let data;
-
-  try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON"
-    }, 400);
-  }
-
-  const initData = data.initData;
-
-  if (
-    typeof initData !== "string" ||
-    initData.length === 0 ||
-    initData.length > 10000
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid Telegram authentication data"
-    }, 401);
-  }
-
-  try {
-    const params = new URLSearchParams(initData);
-    const receivedHash = params.get("hash");
-    const authDate = Number(params.get("auth_date"));
-    const userJson = params.get("user");
-
-    if (
-      !receivedHash ||
-      !/^[a-f0-9]{64}$/i.test(receivedHash) ||
-      !Number.isSafeInteger(authDate) ||
-      !userJson
-    ) {
-      return respond({
-        ok: false,
-        error: "Invalid Telegram authentication data"
-      }, 401);
-    }
-
-    const now = Math.floor(Date.now() / 1000);
-
-    if (
-      authDate > now + 60 ||
-      now - authDate > 86400
-    ) {
-      return respond({
-        ok: false,
-        error: "Telegram authentication has expired. Reopen the Mini App."
-      }, 401);
-    }
-
-    params.delete("hash");
-
-    const dataCheckString = [...params.entries()]
-      .sort(([a], [b]) =>
-        a < b ? -1 : a > b ? 1 : 0
-      )
-      .map(([key, value]) => `${key}=${value}`)
-      .join("\n");
-
-    const encoder = new TextEncoder();
-
-    const secretKeyMaterial =
-      await crypto.subtle.importKey(
-        "raw",
-        encoder.encode("WebAppData"),
-        {
-          name: "HMAC",
-          hash: "SHA-256"
-        },
-        false,
-        ["sign"]
-      );
-
-    const secretKeyBytes =
-      await crypto.subtle.sign(
-        "HMAC",
-        secretKeyMaterial,
-        encoder.encode(env.TELEGRAM_BOT_TOKEN)
-      );
-
-    const secretKey =
-      await crypto.subtle.importKey(
-        "raw",
-        secretKeyBytes,
-        {
-          name: "HMAC",
-          hash: "SHA-256"
-        },
-        false,
-        ["sign"]
-      );
-
-    const calculatedHashBytes =
-      await crypto.subtle.sign(
-        "HMAC",
-        secretKey,
-        encoder.encode(dataCheckString)
-      );
-
-    const calculatedHash = Array.from(
-      new Uint8Array(calculatedHashBytes)
-    )
-      .map(byte => byte.toString(16).padStart(2, "0"))
-      .join("");
-
-    const normalizedHash = receivedHash.toLowerCase();
-
-    if (calculatedHash.length !== normalizedHash.length) {
-      return respond({
-        ok: false,
-        error: "Telegram authentication failed"
-      }, 401);
-    }
-
-    let difference = 0;
-
-    for (let i = 0; i < calculatedHash.length; i++) {
-      difference |=
-        calculatedHash.charCodeAt(i) ^
-        normalizedHash.charCodeAt(i);
-    }
-
-    if (difference !== 0) {
-      return respond({
-        ok: false,
-        error: "Telegram authentication failed"
-      }, 401);
-    }
-
-    let telegramUser;
-
-    try {
-      telegramUser = JSON.parse(userJson);
-    } catch {
-      return respond({
-        ok: false,
-        error: "Invalid Telegram user data"
-      }, 401);
-    }
-
-    const userId = String(telegramUser.id ?? "");
-
-    if (
-      !/^\d+$/.test(userId) ||
-      userId.length > 20
-    ) {
-      return respond({
-        ok: false,
-        error: "Invalid Telegram user ID"
-      }, 401);
-    }
-
-    const coordinatorId =
-      env.MONETAG_REWARD_COORDINATOR.idFromName(
-        "cooldown:" + userId
-      );
-
-    const coordinator =
-      env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
-
-    const coordinatorResponse = await coordinator.fetch(
-      "https://coordinator.internal/",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-  action: [
-    "check_cooldown",
-    "reserve_watch",
-    "finish_watch",
-    "cancel_watch"
-  ].includes(data.action)
-    ? data.action
-    : "check_cooldown",
-  user_id: userId,
-  reservation_token: data.reservation_token
-})
-      }
-    );
-
-    const result = await coordinatorResponse.json();
-
-    return respond({
-      ok: coordinatorResponse.ok && result.ok === true,
-      coordinator_http_status: coordinatorResponse.status,
-      result: result,
-      message: "Cooldown check completed. No reward was credited."
-    }, coordinatorResponse.ok ? 200 : 502);
-
-  } catch (error) {
-    console.error("Monetag cooldown enforcement failed:", error);
-
-    return respond({
-      ok: false,
-      error: "Cooldown enforcement failed"
-    }, 500);
-  }
-      }
-// ==========================================
-// END MONETAG COOLDOWN CHECK
-// ==========================================
-// ==========================================
-// END MONETAG COORDINATOR HEALTH CHECK
-// ==========================================
-    // ==========================================
-// MONETAG EVENT VALIDATION — READ ONLY
-// ==========================================
-if (
-  url.pathname === "/monetag-validate-event" &&
-  request.method === "POST"
-) {
-  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
-    return respond({
-      ok: false,
-      error: "Required API configuration is missing",
-      read_only: true
-    }, 503);
-  }
-
-  if (
-    request.headers.get("Authorization") !==
-    "Bearer " + env.TBC_API_SECRET
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized",
-      read_only: true
-    }, 401);
-  }
-
-  let data;
-
-  try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON",
-      read_only: true
-    }, 400);
-  }
-
-  const ymid = String(data.ymid || "");
-  const telegramId = String(data.user_id || "");
-
-  if (
-    !/^ra_[A-Za-z0-9_-]{1,120}$/.test(ymid) ||
-    !/^\d{1,25}$/.test(telegramId)
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid session ID or user ID",
-      read_only: true
-    }, 400);
-  }
-
-  try {
-    const sessionRaw =
-      await env.RAPID_ADS_BALANCES.get(`monetag:session:${ymid}`);
-
-    if (!sessionRaw) {
-      return respond({
-        ok: true,
-        valid: false,
-        reason: "Session not found",
-        read_only: true
-      });
-    }
-
-    let session;
-
-    try {
-      session = JSON.parse(sessionRaw);
-    } catch {
-      return respond({
-        ok: false,
-        error: "Stored session data is invalid",
-        read_only: true
-      }, 500);
-    }
-
-    if (
-      !session ||
-      String(session.user_id || "") !== telegramId ||
-      String(session.ymid || "") !== ymid
-    ) {
-      return respond({
-        ok: true,
-        valid: false,
-        reason: "Session user verification failed",
-        read_only: true
-      });
-    }
-
-    const eventTypes = ["impression", "click"];
-    const rewardTypes = ["valued", "non_valued"];
-    const events = [];
-
-    for (const eventType of eventTypes) {
-      for (const rewardType of rewardTypes) {
-        const eventKey =
-          `monetag:event:${ymid}:${eventType}:${rewardType}`;
-
-        const eventRaw =
-          await env.RAPID_ADS_BALANCES.get(eventKey);
-
-        if (!eventRaw) {
-          continue;
-        }
-
-        let event;
-
-        try {
-          event = JSON.parse(eventRaw);
-        } catch {
-          continue;
-        }
-
-        if (
-          !event ||
-          String(event.ymid || "") !== ymid ||
-          String(event.user_id || "") !== telegramId ||
-          event.event_type !== eventType ||
-          event.reward_event_type !== rewardType
-        ) {
-          continue;
-        }
-
-        events.push(event);
-      }
-    }
-
-    if (events.length === 0) {
-      return respond({
-        ok: true,
-        valid: false,
-        reason: "No matching stored event found",
-        read_only: true
-      });
-    }
-
-    const results = [];
-
-    for (const event of events) {
-      const coordinatorId =
-env.MONETAG_REWARD_COORDINATOR.idFromName(
-"cooldown:" + String(session.user_id)
-);
-
-const coordinator =
-env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
-
-const coordinatorResponse = await coordinator.fetch(
-"https://coordinator.internal/",
-{
-method: "POST",
-headers: {
-"Content-Type": "application/json"
-},
-body: JSON.stringify({
-action: "inspect_session",
-user_id: String(session.user_id),
-ymid: ymid
-})
-}
-);
-
-let coordinatorResult;
-
-try {
-coordinatorResult = await coordinatorResponse.json();
-} catch {
-coordinatorResult = {
-ok: false,
-error: "Invalid coordinator response"
-};
-}
-
-results.push({
-event_type: event.event_type,
-reward_event_type: event.reward_event_type,
-coordinator_http_status: coordinatorResponse.status,
-inspection: coordinatorResult
-});
-    }
-
-    return respond({
-      ok: true,
-      ymid: ymid,
-      session_found: true,
-      event_count: results.length,
-      results: results,
-      read_only: true,
-      message: "Session inspection completed. No balance or event record was changed."
+      can_watch: true,
+      reservation_token: token,
+      remaining_seconds: 0
     });
 
   } catch (error) {
-    console.error("Monetag event validation failed:", error);
-
-    return respond({
+    return jsonResponse({
       ok: false,
-      error: "Could not complete event validation",
-      read_only: true
-    }, 500);
+      error: error.message
+    }, 400);
   }
 }
-// ==========================================
-// END MONETAG EVENT VALIDATION
-// ==========================================
-    // TEST: Atomically reserve a verified Monetag reward session.
-// TEST ONLY — DOES NOT CREDIT ANY BALANCE.
-if (url.pathname === "/monetag-reserve-reward-test") {
 
-  if (request.method !== "POST") {
-    return respond({
-      ok: false,
-      error: "Method not allowed",
-      reward_credited: false
-    }, 405);
-  }
+// ============================================================
+// REGISTER A MONETAG SESSION
+// ============================================================
 
-  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
-    return respond({
-      ok: false,
-      error: "Required configuration is missing",
-      reward_credited: false
-    }, 503);
-  }
-
-  if (
-    request.headers.get("Authorization") !==
-    "Bearer " + env.TBC_API_SECRET
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized",
-      reward_credited: false
-    }, 401);
-  }
-
-  let data;
-
+async function handleMonetagRegister(request, env) {
   try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON",
-      reward_credited: false
-    }, 400);
-  }
+    const { body, user } = await authenticateRequest(request, env);
+    const db = getDatabase(env);
 
-  const userId = String(data.user_id || "");
-  const ymid = String(data.ymid || "");
-
-  if (
-    !/^\d{1,25}$/.test(userId) ||
-    !/^ra_[A-Za-z0-9_-]{1,120}$/.test(ymid)
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid user ID or session ID",
-      reward_credited: false
-    }, 400);
-  }
-
-  const coordinatorId =
-    env.MONETAG_REWARD_COORDINATOR.idFromName("cooldown:" + userId);
-
-  const coordinator =
-    env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
-
-  const result = await coordinator.fetch(
-    "https://coordinator.internal/",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        action: "reserve_reward_processing",
-        user_id: userId,
-        ymid: ymid
-      })
-    }
-  );
-
-  const resultData = await result.json();
-
-  return respond({
-    http_status: result.status,
-    result: resultData,
-    test_only: true,
-    reward_credited: false
-  }, result.status);
-}
-    // TEST ONLY: Finalize a reserved Monetag session.
-if (
-  url.pathname === "/monetag-finalize-reward-test" &&
-  request.method === "POST"
-) {
-  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
-    return respond({
-      ok: false,
-      error: "Required configuration is missing"
-    }, 503);
-  }
-
-  if (
-    request.headers.get("Authorization") !==
-    "Bearer " + env.TBC_API_SECRET
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized"
-    }, 401);
-  }
-
-  let data;
-
-  try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON"
-    }, 400);
-  }
-
-  const userId = String(data.user_id || "");
-  const ymid = String(data.ymid || "");
-
-  if (
-    !/^\d{1,25}$/.test(userId) ||
-    !/^ra_[A-Za-z0-9_-]{1,120}$/.test(ymid)
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid user ID or session ID"
-    }, 400);
-  }
-
-  const coordinatorId =
-    env.MONETAG_REWARD_COORDINATOR.idFromName("cooldown:" + userId);
-
-  const coordinator =
-    env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
-
-  const result = await coordinator.fetch(
-    "https://coordinator.internal/",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        action: "finalize_reward_processing_test",
-        user_id: userId,
-        ymid: ymid
-      })
-    }
-  );
-
-  const resultData = await result.json();
-
-  return respond({
-    http_status: result.status,
-    result: resultData,
-    test_only: true,
-    reward_credited: false
-  }, result.status);
-  }
-    // TEST ONLY: Recover an interrupted Monetag reservation.
-if (
-  url.pathname === "/monetag-recover-reward-test" &&
-  request.method === "POST"
-) {
-  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
-    return respond({
-      ok: false,
-      error: "Required configuration is missing",
-      reward_credited: false
-    }, 503);
-  }
-
-  if (
-    request.headers.get("Authorization") !==
-    "Bearer " + env.TBC_API_SECRET
-  ) {
-    return respond({
-      ok: false,
-      error: "Unauthorized",
-      reward_credited: false
-    }, 401);
-  }
-
-  let data;
-
-  try {
-    data = await request.json();
-  } catch {
-    return respond({
-      ok: false,
-      error: "Invalid JSON",
-      reward_credited: false
-    }, 400);
-  }
-
-  const userId = String(data.user_id || "");
-  const ymid = String(data.ymid || "");
-
-  if (
-    !/^\d{1,25}$/.test(userId) ||
-    !/^ra_[A-Za-z0-9_-]{1,120}$/.test(ymid)
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid user ID or session ID",
-      reward_credited: false
-    }, 400);
-  }
-
-  const coordinatorId =
-    env.MONETAG_REWARD_COORDINATOR.idFromName("cooldown:" + userId);
-
-  const coordinator =
-    env.MONETAG_REWARD_COORDINATOR.get(coordinatorId);
-
-  const result = await coordinator.fetch(
-    "https://coordinator.internal/",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        action: "recover_reward_processing_test",
-        user_id: userId,
-        ymid: ymid
-      })
-    }
-  );
-
-  const resultData = await result.json();
-
-  return respond({
-    http_status: result.status,
-    result: resultData,
-    test_only: true,
-    reward_credited: false
-  }, result.status);
-    }
-    if (url.pathname === "/monetag-concurrency-test") {
-  if (request.method !== "POST") {
-    return respond({ ok: false, error: "POST required" }, 405);
-  }
-
-  if (!env.TBC_API_SECRET || !env.MONETAG_REWARD_COORDINATOR) {
-    return respond({ ok: false, error: "Server configuration missing" }, 500);
-  }
-
-  if (request.headers.get("Authorization") !== "Bearer " + env.TBC_API_SECRET) {
-    return respond({ ok: false, error: "Unauthorized" }, 401);
-  }
-
-  try {
-    const body = await request.json();
-    const userId = String(body.user_id || "");
     const ymid = String(body.ymid || "");
+    const reservationToken = String(body.reservation_token || "");
 
-    if (!userId || !ymid) {
-      return respond({ ok: false, error: "Missing user_id or ymid" }, 400);
+    if (!ymid || ymid.length > 150) {
+      throw new Error("Invalid Monetag session ID.");
     }
 
-    const id = env.MONETAG_REWARD_COORDINATOR.idFromName("cooldown:" + userId);
-    const coordinator = env.MONETAG_REWARD_COORDINATOR.get(id);
-
-    const makeReservation = () => coordinator.fetch(
-      "https://coordinator/reserve",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "reserve_reward_processing",
-          user_id: userId,
-          ymid: ymid
-        })
-      }
-    );
-
-    const [firstResponse, secondResponse] = await Promise.all([
-      makeReservation(),
-      makeReservation()
-    ]);
-
-    const [firstResult, secondResult] = await Promise.all([
-      firstResponse.json(),
-      secondResponse.json()
-    ]);
-
-    return respond({
-      ok: true,
-      test_only: true,
-      first_request: firstResult,
-      second_request: secondResult,
-      reward_credited: false
-    });
-
-  } catch (error) {
-    return respond({
-      ok: false,
-      error: String(error),
-      test_only: true,
-      reward_credited: false
-    }, 500);
-  }
-    }
-    if (url.pathname === "/monetag-authorize-credit-test") {
-  if (request.method !== "POST") {
-    return respond({ ok: false, error: "POST required." }, 405);
-  }
-
-  const auth = request.headers.get("Authorization");
-
-  if (auth !== "Bearer " + env.TBC_API_SECRET) {
-    return respond({ ok: false, error: "Unauthorized." }, 401);
-  }
-
-  try {
-    const body = await request.json();
-    const userId = String(body.user_id || "");
-    const ymid = String(body.ymid || "");
-
-    if (!userId || !ymid) {
-      return respond({
-        ok: false,
-        error: "Missing user_id or ymid."
-      }, 400);
+    if (!reservationToken) {
+      throw new Error("Reservation token is required.");
     }
 
-    const id = env.MONETAG_REWARD_COORDINATOR.idFromName(
-      "cooldown:" + userId
-    );
+    const registeredUser = await getRegisteredUser(db, user.id);
 
-    const stub = env.MONETAG_REWARD_COORDINATOR.get(id);
-
-    const result = await stub.fetch(
-      "https://coordinator/",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          action: "authorize_reward_credit",
-          user_id: userId,
-          ymid: ymid
-        })
-      }
-    );
-
-    const data = await result.json();
-
-    return respond({
-      ok: data.ok === true,
-      test_only: true,
-      result: data,
-      balance_credited: false
-    });
-
-  } catch (error) {
-    return respond({
-      ok: false,
-      test_only: true,
-      error: String(error),
-      balance_credited: false
-    }, 500);
-  }
-    }
-    if (url.pathname === "/monetag-inspect-credit-test") {
-  if (request.method !== "POST") {
-    return respond({ ok: false, error: "POST required." }, 405);
-  }
-
-  const auth = request.headers.get("Authorization");
-
-  if (auth !== "Bearer " + env.TBC_API_SECRET) {
-    return respond({ ok: false, error: "Unauthorized." }, 401);
-  }
-
-  try {
-    const body = await request.json();
-    const userId = String(body.user_id || "");
-    const ymid = String(body.ymid || "");
-
-    if (!userId || !ymid) {
-      return respond({
-        ok: false,
-        error: "Missing user_id or ymid."
-      }, 400);
+    if (!registeredUser?.faucetpay_email) {
+      throw new Error("Register your FaucetPay email first.");
     }
 
-    const id = env.MONETAG_REWARD_COORDINATOR.idFromName(
-      "cooldown:" + userId
-    );
+    const now = unixTime();
 
-    const stub = env.MONETAG_REWARD_COORDINATOR.get(id);
-
-    const result = await stub.fetch(
-      "https://coordinator/",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          action: "inspect_reward_processing",
-          user_id: userId,
-          ymid: ymid
-        })
-      }
-    );
-
-    const data = await result.json();
-
-    return respond({
-      ok: data.ok === true,
-      test_only: true,
-      result: data,
-      balance_credited: false
-    });
-
-  } catch (error) {
-    return respond({
-      ok: false,
-      test_only: true,
-      error: String(error),
-      balance_credited: false
-    }, 500);
-  }
-      }
-    if (url.pathname === "/monetag-claim-execution-test") {
-  if (request.method !== "POST") {
-    return respond({ ok: false, error: "POST required." }, 405);
-  }
-
-  if (
-    request.headers.get("Authorization") !==
-    "Bearer " + env.TBC_API_SECRET
-  ) {
-    return respond({ ok: false, error: "Unauthorized." }, 401);
-  }
-
-  try {
-    const body = await request.json();
-    const userId = String(body.user_id || "");
-    const ymid = String(body.ymid || "");
-
-    if (!userId || !ymid) {
-      return respond({
-        ok: false,
-        error: "Missing user_id or ymid."
-      }, 400);
-    }
-
-    const id = env.MONETAG_REWARD_COORDINATOR.idFromName(
-      "cooldown:" + userId
-    );
-
-    const stub = env.MONETAG_REWARD_COORDINATOR.get(id);
-
-    const result = await stub.fetch(
-      "https://coordinator/",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          action: "claim_credit_execution_test",
-          user_id: userId,
-          ymid: ymid
-        })
-      }
-    );
-
-    const data = await result.json();
-
-    return respond({
-      ok: data.ok === true,
-      test_only: true,
-      result: data,
-      balance_credited: false
-    });
-
-  } catch (error) {
-    return respond({
-      ok: false,
-      test_only: true,
-      error: String(error),
-      balance_credited: false
-    }, 500);
-  }
-      }
-    if (
-  request.method === "POST" &&
-  url.pathname === "/monetag-retry-recovery-test"
-) {
-  try {
-    const auth = request.headers.get("Authorization") || "";
-
-    if (
-      !env.TBC_API_SECRET ||
-      auth !== "Bearer " + env.TBC_API_SECRET
-    ) {
-      return respond({ ok: false, error: "Unauthorized" }, 401);
-    }
-
-    if (
-      !env.MONETAG_REWARD_COORDINATOR ||
-      !env.RAPID_ADS_BALANCES
-    ) {
-      return respond({
-        ok: false,
-        error: "Required configuration missing"
-      }, 503);
-    }
-
-    const body = await request.json();
-    const userId = String(body.user_id || "");
-
-    if (!/^\d{1,25}$/.test(userId)) {
-      return respond({
-        ok: false,
-        error: "Invalid test user ID"
-      }, 400);
-    }
-
-    const ymid = "ra_retrytest_" + crypto.randomUUID();
-
-    const id = env.MONETAG_REWARD_COORDINATOR.idFromName(
-      "cooldown:" + userId
-    );
-
-    const stub = env.MONETAG_REWARD_COORDINATOR.get(id);
-
-    const claimRequest = async () => {
-      const response = await stub.fetch(
-        "https://coordinator/",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            action: "claim_valued_event",
-            user_id: userId,
-            ymid: ymid
-          })
-        }
-      );
-
-      return await response.json();
-    };
-
-    // First claim: simulate a failed KV write by not writing.
-    const firstClaim = await claimRequest();
-
-    if (!firstClaim.ok || firstClaim.claimed !== true) {
-      return respond({
-        ok: false,
-        stage: "first_claim",
-        result: firstClaim,
-        test_only: true,
-        balance_credited: false
-      }, 500);
-    }
-
-    // Retry the same claim.
-    const retryClaim = await claimRequest();
-
-    if (
-      !retryClaim.ok ||
-      retryClaim.claimed !== true ||
-      retryClaim.duplicate !== true
-    ) {
-      return respond({
-        ok: false,
-        stage: "retry_claim",
-        result: retryClaim,
-        test_only: true,
-        balance_credited: false
-      }, 500);
-    }
-
-    // Now save a synthetic test event.
-    const eventKey =
-      `monetag:retry-test:${ymid}`;
-
-    await env.RAPID_ADS_BALANCES.put(
-      eventKey,
-      JSON.stringify({
-        ymid: ymid,
-        user_id: userId,
-        reward_event_type: "valued",
-        test_only: true,
-        credited: false
-      }),
-      { expirationTtl: 300 }
-    );
-
-    const saved = await env.RAPID_ADS_BALANCES.get(eventKey);
-
-    return respond({
-      ok: true,
-      test_only: true,
-      ymid: ymid,
-      first_claim_succeeded: firstClaim.claimed === true,
-      retry_claim_succeeded: retryClaim.claimed === true,
-      retry_was_duplicate: retryClaim.duplicate === true,
-      event_saved_after_retry: Boolean(saved),
-      simulated_first_kv_write_failure: true,
-      balance_credited: false,
-      message: "Retry recovery test completed."
-    });
-
-  } catch (error) {
-    return respond({
-      ok: false,
-      test_only: true,
-      error: String(error),
-      balance_credited: false
-    }, 500);
-  }
-  }
-    if (
-  request.method === "POST" &&
-  url.pathname === "/monetag-latest-session"
-) {
-  try {
-    const auth = request.headers.get("Authorization") || "";
-
-    if (
-      !env.TBC_API_SECRET ||
-      auth !== "Bearer " + env.TBC_API_SECRET
-    ) {
-      return respond({ ok: false, error: "Unauthorized" }, 401);
-    }
-
-    const body = await request.json();
-    const userId = String(body.user_id || "");
-
-    if (!/^\d{1,25}$/.test(userId)) {
-      return respond({ ok: false, error: "Invalid user ID" }, 400);
-    }
-
-    const listing = await env.RAPID_ADS_BALANCES.list({
-      prefix: "monetag:session:",
-      limit: 1000
-    });
-
-    const sessions = [];
-
-    for (const key of listing.keys) {
-      const raw = await env.RAPID_ADS_BALANCES.get(key.name);
-
-      if (!raw) continue;
-
-      const session = JSON.parse(raw);
-
-      if (String(session.user_id) === userId) {
-        sessions.push(session);
-      }
-    }
-
-    sessions.sort((a, b) =>
-      String(b.created_at || "").localeCompare(
-        String(a.created_at || "")
-      )
-    );
-
-    return respond({
-      ok: true,
-      user_id: userId,
-      session_found: sessions.length > 0,
-      latest_session: sessions.length > 0 ? sessions[0] : null,
-      sessions_checked: listing.keys.length,
-      read_only: true,
-      balance_credited: false
-    });
-
-  } catch (error) {
-    return respond({
-      ok: false,
-      error: String(error),
-      read_only: true,
-      balance_credited: false
-    }, 500);
-  }
-      }
-    if (request.method !== "GET") {
-      return respond({
-        ok: false,
-        error: "Method not allowed"
-      }, 405);
-    }
-    return respond({
-      ok: true,
-      service: "Rapid Ads API",
-      message:
-        "Backend is running. No rewards have been credited."
-    });
-  }
-};
-// ==========================================
-// MONETAG REWARD COORDINATOR
-// READ-ONLY TEST VERSION
-// ==========================================
-export class MonetagRewardCoordinator {
-  constructor(ctx, env) {
-    this.ctx = ctx;
-    this.env = env;
-  }
-
-  async fetch(request) {
-    const headers = {
-      "Content-Type": "application/json"
-    };
-
-    const respond = (data, status = 200) =>
-      new Response(JSON.stringify(data), {
-        status,
-        headers
-      });
-
-    if (request.method !== "POST") {
-      return respond({
-        ok: false,
-        error: "Method not allowed"
-      }, 405);
-    }
-
-    let data;
-
-    try {
-      data = await request.json();
-    } catch {
-      return respond({
-        ok: false,
-        error: "Invalid JSON"
-      }, 400);
-    }
-
-    // Preserve the existing read-only health check.
-    if (data.action === "health_check") {
-      return respond({
-        ok: true,
-        coordinator: "MonetagRewardCoordinator",
-        mode: "read_only",
-        message: "Coordinator is running. No rewards were credited."
-      });
-    }
-    // Securely bind one Monetag session to an active reservation.
-if (data.action === "bind_ymid") {
-  const userId = String(data.user_id || "");
-  const reservationToken = String(data.reservation_token || "");
-  const ymid = String(data.ymid || "");
-
-  if (
-    !/^\d{1,25}$/.test(userId) ||
-    !reservationToken ||
-    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid user ID, reservation token, or session ID"
-    }, 400);
-  }
-
-  const reservationKey = `monetag:reservation:${userId}`;
-  const now = Date.now();
-
-  return await this.ctx.storage.transaction(async (txn) => {
-    const reservation = await txn.get(reservationKey);
+    const reservation = await db.prepare(`
+      SELECT reservation_token, expires_at
+      FROM monetag_reservations
+      WHERE telegram_id = ?
+    `).bind(user.id).first();
 
     if (
       !reservation ||
-      reservation.token !== reservationToken ||
-      Number(reservation.expires_at || 0) <= now
+      reservation.reservation_token !== reservationToken ||
+      Number(reservation.expires_at) < now
     ) {
-      return respond({
+      throw new Error("Reservation is invalid or expired.");
+    }
+
+    // Prevent a duplicate Monetag session ID.
+    const duplicate = await db.prepare(`
+      SELECT id
+      FROM monetag_sessions
+      WHERE ymid = ?
+    `).bind(ymid).first();
+
+    if (duplicate) {
+      throw new Error("This Monetag session has already been registered.");
+    }
+
+    const id = randomId("monetag");
+
+    await db.prepare(`
+      INSERT INTO monetag_sessions (
+        id,
+        telegram_id,
+        ymid,
+        status,
+        reward_units,
+        created_at
+      )
+      VALUES (?, ?, ?, 'PENDING', ?, ?)
+    `).bind(
+      id,
+      user.id,
+      ymid,
+      CONFIG.MONETAG_REWARD_UNITS,
+      now
+    ).run();
+
+    await db.prepare(`
+      DELETE FROM monetag_reservations
+      WHERE telegram_id = ?
+      AND reservation_token = ?
+    `).bind(user.id, reservationToken).run();
+
+    return jsonResponse({
+      ok: true,
+      registered: true,
+      ymid,
+      session_id: id
+    });
+
+  } catch (error) {
+    return jsonResponse({
+      ok: false,
+      error: error.message
+    }, 400);
+  }
+}
+
+// ============================================================
+// MONETAG POSTBACK
+// ============================================================
+
+async function handleMonetagPostback(request, env) {
+  try {
+    if (!env.MONETAG_POSTBACK_SECRET) {
+      throw new Error("Monetag postback secret is not configured.");
+    }
+
+    const url = new URL(request.url);
+    const params = url.searchParams;
+
+    const suppliedSecret = params.get("secret") || "";
+
+    if (!timingSafeEqual(
+      suppliedSecret,
+      env.MONETAG_POSTBACK_SECRET
+    )) {
+      return jsonResponse({
         ok: false,
-        error: "Reservation is invalid or expired"
-      }, 409);
+        error: "Unauthorized postback."
+      }, 401);
+    }
+
+    const ymid = params.get("ymid");
+    const zone = params.get("zone");
+    const event = params.get("event");
+    const rewardType = params.get("reward_type");
+
+    if (!ymid || zone !== CONFIG.MONETAG_ZONE_ID) {
+      throw new Error("Invalid Monetag postback details.");
     }
 
     if (
-      reservation.ymid &&
-      reservation.ymid !== ymid
+      event !== "impression" ||
+      rewardType !== "valued"
     ) {
-      return respond({
-        ok: false,
-        error: "Reservation is already bound to another session"
-      }, 409);
-    }
-
-    await txn.put(reservationKey, {
-      ...reservation,
-      ymid: ymid,
-      bound_at: now
-    });
-
-    return respond({
-      ok: true,
-      bound: true,
-      reward_credited: false,
-      message: "Session bound to reservation. No reward was credited."
-    });
-  });
-  }
-        // Reserve one Monetag watch session without starting the cooldown.
-    if (data.action === "reserve_watch") {
-      const userId = String(data.user_id || "");
-
-      if (!/^\d{1,25}$/.test(userId)) {
-        return respond({
-          ok: false,
-          error: "Invalid user ID"
-        }, 400);
-      }
-
-      const now = Date.now();
-      const cooldownKey = `monetag:last_watch:${userId}`;
-      const reservationKey = `monetag:reservation:${userId}`;
-      const reservationLifetimeMs = 10 * 60 * 1000;
-
-      return await this.ctx.storage.transaction(async (txn) => {
-        const lastRaw = await txn.get(cooldownKey);
-        const lastTime = Number(lastRaw || 0);
-        const remaining = Math.max(
-          0,
-          60 - Math.floor((now - lastTime) / 1000)
-        );
-
-        if (remaining > 0) {
-          return respond({
-            ok: true,
-            can_watch: false,
-            remaining_seconds: remaining,
-            message: "Cooldown is active."
-          });
-        }
-
-        const existing = await txn.get(reservationKey);
-
-        if (
-          existing &&
-          Number(existing.expires_at || 0) > now
-        ) {
-          return respond({
-            ok: true,
-            can_watch: false,
-            reservation_active: true,
-            message: "An advertisement session is already in progress."
-          });
-        }
-
-        const reservationToken = crypto.randomUUID();
-
-        await txn.put(reservationKey, {
-          token: reservationToken,
-          created_at: now,
-          expires_at: now + reservationLifetimeMs
-        });
-
-        return respond({
-          ok: true,
-          can_watch: true,
-          reservation_token: reservationToken,
-          message: "Watch session reserved. Cooldown has not started."
-        });
-      });
-    }
-
-    // Finish a reserved ad attempt and start the 60-second cooldown.
-    if (data.action === "finish_watch") {
-const userId = String(data.user_id || "");
-const reservationToken = String(data.reservation_token || "");
-
-if (
-!/^\d{1,25}$/.test(userId) ||
-!reservationToken
-) {
-return respond({
-ok: false,
-error: "Invalid user ID or reservation token",
-reward_credited: false
-}, 400);
-}
-
-const reservationKey = `monetag:reservation:${userId}`;
-const cooldownKey = `monetag:last_watch:${userId}`;
-const now = Date.now();
-
-return await this.ctx.storage.transaction(async (txn) => {
-const reservation = await txn.get(reservationKey);
-
-if (
-  !reservation ||
-  reservation.token !== reservationToken ||
-  Number(reservation.expires_at || 0) <= now ||
-  !reservation.ymid
-) {
-  return respond({
-    ok: false,
-    error: "Watch session is invalid, expired, or not registered",
-    reward_credited: false
-  }, 409);
-}
-
-const ymid = String(reservation.ymid);
-const attemptKey = `monetag:attempt:${ymid}`;
-const claimKey = `monetag:claim:${ymid}`;
-const verifiedKey = `monetag:verified:${ymid}`;
-
-const existingClaim = await txn.get(claimKey);
-
-const matchingPostback =
-  existingClaim &&
-  String(existingClaim.user_id) === userId &&
-  String(existingClaim.ymid) === ymid;
-
-await txn.put(attemptKey, {
-  user_id: userId,
-  ymid: ymid,
-  completed_at: now,
-  reward_claimed: false
-});
-
-if (matchingPostback) {
-  await txn.put(verifiedKey, {
-    user_id: userId,
-    ymid: ymid,
-    attempt_recorded: true,
-    valued_postback_recorded: true,
-    matched_at: now,
-    reward_eligible_for_review: true,
-    reward_credited: false
-  });
-}
-
-await txn.put(cooldownKey, now);
-await txn.delete(reservationKey);
-
-return respond({
-  ok: true,
-  cooldown_seconds: 60,
-  remaining_seconds: 60,
-  cooldown_started: true,
-  attempt_recorded: true,
-  postback_matched: Boolean(matchingPostback),
-  reward_eligible_for_review: Boolean(matchingPostback),
-  reward_credited: false,
-  message: matchingPostback
-    ? "Ad attempt and valued postback matched. No reward credited."
-    : "Ad attempt recorded. Waiting for a matching valued postback. No reward credited."
-});
-
-});
-  }
-
-    // Cancel a reserved session if the ad fails to open.
-    if (data.action === "cancel_watch") {
-      const userId = String(data.user_id || "");
-      const reservationToken = String(data.reservation_token || "");
-
-      if (
-        !/^\d{1,25}$/.test(userId) ||
-        !reservationToken
-      ) {
-        return respond({
-          ok: false,
-          error: "Invalid user ID or reservation token"
-        }, 400);
-      }
-
-      const reservationKey = `monetag:reservation:${userId}`;
-
-      return await this.ctx.storage.transaction(async (txn) => {
-        const reservation = await txn.get(reservationKey);
-
-        if (!reservation || reservation.token !== reservationToken) {
-          return respond({
-            ok: false,
-            error: "Watch session is invalid or already closed"
-          }, 409);
-        }
-
-        await txn.delete(reservationKey);
-
-        return respond({
-          ok: true,
-          cancelled: true,
-          reward_credited: false,
-          message: "Watch reservation cancelled. No reward was credited."
-        });
-      });
-        }
-// Read-only Monetag cooldown check (60 seconds)
-if (data.action === "check_cooldown") {
-  const userId = String(data.user_id || "");
-  const now = Date.now();
-  const cooldownSeconds = 60;
-
-  if (!/^\d{1,25}$/.test(userId)) {
-    return respond({
-      ok: false,
-      error: "Invalid user ID",
-      read_only: true
-    }, 400);
-  }
-
-  const lastKey = `monetag:last_watch:${userId}`;
-  const lastRaw = await this.ctx.storage.get(lastKey);
-  const lastTime = Number(lastRaw || 0);
-  const remaining = Math.max(
-    0,
-    cooldownSeconds - Math.floor((now - lastTime) / 1000)
-  );
-
-  return respond({
-    ok: true,
-    user_id: userId,
-    cooldown_seconds: cooldownSeconds,
-    remaining_seconds: remaining,
-    can_watch: remaining === 0,
-    read_only: true,
-    message: "Cooldown checked. No cooldown or reward data was changed."
-  });
-  }
-        // TEST ONLY: start a 60-second cooldown without crediting rewards
-    if (data.action === "test_start_cooldown") {
-      const userId = String(data.user_id || "");
-
-      if (!/^\d{1,25}$/.test(userId)) {
-        return respond({
-          ok: false,
-          error: "Invalid user ID",
-          test_only: true
-        }, 400);
-      }
-
-      await this.ctx.storage.put(
-        `monetag:last_watch:${userId}`,
-        Date.now()
-      );
-
-      return respond({
+      return jsonResponse({
         ok: true,
-        user_id: userId,
-        cooldown_seconds: 60,
-        test_only: true,
-        reward_credited: false,
-        message: "Test cooldown started. No balance or reward was changed."
+        ignored: true,
+        message: "Event is not reward eligible."
       });
-        }
-    // Atomically check and start the 60-second cooldown.
-    // Atomically allow only one qualifying claim per Monetag session.
-// This records a claim only; it does not credit any reward.
-// TEMPORARY TEST: call the actual claim handler twice.
-// No reward is credited by this test.
-    if (data.action === "check_and_start_cooldown") {
-      const userId = String(data.user_id || "");
-
-      if (!/^\d{1,25}$/.test(userId)) {
-        return respond({
-          ok: false,
-          error: "Invalid user ID"
-        }, 400);
-      }
-
-      const key = `monetag:last_watch:${userId}`;
-      const now = Date.now();
-      const cooldownSeconds = 60;
-
-      // Keep the read-and-write together to prevent concurrent requests
-      // from both passing the cooldown check.
-      return await this.ctx.storage.transaction(async (txn) => {
-        const lastRaw = await txn.get(key);
-        const lastTime = Number(lastRaw || 0);
-        const elapsedSeconds = Math.floor((now - lastTime) / 1000);
-        const remaining = Math.max(
-          0,
-          cooldownSeconds - elapsedSeconds
-        );
-
-        if (remaining > 0) {
-          return respond({
-            ok: true,
-            user_id: userId,
-            cooldown_seconds: cooldownSeconds,
-            remaining_seconds: remaining,
-            can_watch: false,
-            cooldown_started: false,
-            message: "Cooldown is active."
-          });
-        }
-
-        await txn.put(key, now);
-
-        return respond({
-          ok: true,
-          user_id: userId,
-          cooldown_seconds: cooldownSeconds,
-          remaining_seconds: cooldownSeconds,
-          can_watch: true,
-          cooldown_started: true,
-          message: "Cooldown started. No reward was credited."
-        });
-      });
-        }
-    // Validate supplied records without changing anything.
-    // Record one valued-event claim per Monetag session.
-// This action never credits a reward.
-if (data.action === "claim_valued_event") {
-const userId = String(data.user_id || "");
-const ymid = String(data.ymid || "");
-
-if (
-!/^\d{1,25}$/.test(userId) ||
-!/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
-) {
-return respond({
-ok: false,
-error: "Invalid user ID or Monetag session ID",
-credited: false
-}, 400);
-}
-
-const claimKey = `monetag:claim:${ymid}`;
-const attemptKey = `monetag:attempt:${ymid}`;
-const verifiedKey = `monetag:verified:${ymid}`;
-
-return await this.ctx.storage.transaction(async (txn) => {
-const existing = await txn.get(claimKey);
-const attempt = await txn.get(attemptKey);
-
-if (existing && String(existing.user_id) !== userId) {
-  return respond({
-    ok: false,
-    error: "Session is already associated with another user",
-    credited: false
-  }, 403);
-}
-
-if (!existing) {
-  await txn.put(claimKey, {
-    user_id: userId,
-    ymid: ymid,
-    claimed_at: Date.now(),
-    credited: false
-  });
-}
-
-const matchingAttempt =
-  attempt &&
-  String(attempt.user_id) === userId &&
-  String(attempt.ymid) === ymid;
-
-if (matchingAttempt) {
-  await txn.put(verifiedKey, {
-    user_id: userId,
-    ymid: ymid,
-    attempt_recorded: true,
-    valued_postback_recorded: true,
-    matched_at: Date.now(),
-    reward_eligible_for_review: true,
-    reward_credited: false
-  });
-}
-
-return respond({
-  ok: true,
-  claimed: true,
-  duplicate: Boolean(existing),
-  attempt_matched: Boolean(matchingAttempt),
-  reward_eligible_for_review: Boolean(matchingAttempt),
-  credited: false,
-  message: matchingAttempt
-    ? "Valued postback matched with recorded ad attempt. No reward credited."
-    : "Valued postback recorded; waiting for matching ad attempt. No reward credited."
-});
-
-});
-}
-    // Atomically reserve a verified session for reward processing.
-// This action does not credit any balance.
-if (data.action === "reserve_reward_processing") {
-const userId = String(data.user_id || "");
-const ymid = String(data.ymid || "");
-
-  if (
-    !/^\d{1,25}$/.test(userId) ||
-    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid user ID or session ID",
-      reward_credited: false
-    }, 400);
-  }
-
-  const verifiedKey = `monetag:verified:${ymid}`;
-  const processingKey = `monetag:reward_processing:${ymid}`;
-
-  return await this.ctx.storage.transaction(async (txn) => {
-    const verified = await txn.get(verifiedKey);
-    const existing = await txn.get(processingKey);
-
-    if (
-      !verified ||
-      String(verified.user_id) !== userId ||
-      String(verified.ymid) !== ymid
-    ) {
-      return respond({
-        ok: false,
-        reserved: false,
-        error: "Verified Monetag session not found",
-        reward_credited: false
-      }, 403);
     }
 
-    if (existing) {
-      return respond({
+    const db = getDatabase(env);
+
+    const session = await db.prepare(`
+      SELECT id, telegram_id, status, reward_units
+      FROM monetag_sessions
+      WHERE ymid = ?
+    `).bind(ymid).first();
+
+    if (!session) {
+      throw new Error("Monetag session not found.");
+    }
+
+    if (session.status !== "PENDING") {
+      return jsonResponse({
         ok: true,
-        reserved: false,
         duplicate: true,
-        status: existing.status,
-        reward_credited: false,
-        message: "This session already has a reward-processing record."
+        credited: false
       });
     }
 
-    const now = Date.now();
+    const now = unixTime();
 
-    await txn.put(processingKey, {
-      user_id: userId,
-      ymid: ymid,
-      status: "reserved",
-      reserved_at: now,
-      reward_credited: false
-    });
+    const result = await db.prepare(`
+      UPDATE monetag_sessions
+      SET status = 'VERIFIED',
+          verified_at = ?
+      WHERE id = ?
+      AND status = 'PENDING'
+    `).bind(now, session.id).run();
 
-    return respond({
+    if (!result.meta?.changes) {
+      return jsonResponse({
+        ok: true,
+        duplicate: true,
+        credited: false
+      });
+    }
+
+    return jsonResponse({
       ok: true,
-      reserved: true,
-      duplicate: false,
-      status: "reserved",
-      reward_credited: false,
-      message: "Reward processing reserved. No balance was changed."
+      verified: true,
+      credited: false,
+      reward_units: session.reward_units,
+      currency: CONFIG.MONETAG_REWARD_CURRENCY
     });
-  });
+
+  } catch (error) {
+    return jsonResponse({
+      ok: false,
+      error: error.message
+    }, 400);
+  }
 }
-    if (data.action === "authorize_reward_credit") {
-  const userId = String(data.user_id || "");
-  const ymid = String(data.ymid || "");
 
-  if (!userId || !ymid) {
-    return Response.json({
-      ok: false,
-      error: "Missing user_id or ymid."
-    }, { status: 400 });
-  }
+// ============================================================
+// PAYMENT HISTORY
+// ============================================================
 
-  const result = await this.ctx.storage.transaction(async (txn) => {
-    const verified = await txn.get("monetag:verified:" + ymid);
-    const processing = await txn.get(
-      "monetag:reward_processing:" + ymid
-    );
+async function handlePaymentHistory(request, env) {
+  try {
+    const { user } = await authenticateRequest(request, env);
+    const db = getDatabase(env);
 
-    if (!verified || String(verified.user_id) !== userId) {
-      return {
-        ok: false,
-        authorized: false,
-        error: "Verified session not found for this user."
-      };
-    }
+    const payments = await db.prepare(`
+      SELECT
+        id,
+        amount_units,
+        currency,
+        status,
+        faucetpay_reference,
+        created_at,
+        updated_at
+      FROM payments
+      WHERE telegram_id = ?
+      ORDER BY created_at DESC
+      LIMIT 50
+    `).bind(user.id).all();
 
-    if (!processing || String(processing.user_id) !== userId) {
-      return {
-        ok: false,
-        authorized: false,
-        error: "Reward processing reservation not found."
-      };
-    }
-
-    if (processing.status !== "reserved") {
-      return {
-        ok: true,
-        authorized: false,
-        duplicate: true,
-        status: processing.status,
-        reward_credited: false,
-        message: "This session has already moved beyond the reserved stage."
-      };
-    }
-
-    const now = Date.now();
-
-    processing.status = "crediting";
-    processing.amount = 0.001;
-    processing.currency = "USD";
-    processing.credit_authorized_at = now;
-    processing.reward_credited = false;
-
-    await txn.put(
-      "monetag:reward_processing:" + ymid,
-      processing
-    );
-
-    return {
+    return jsonResponse({
       ok: true,
-      authorized: true,
-      duplicate: false,
-      status: "crediting",
-      amount: 0.001,
-      currency: "USD",
-      reward_credited: false,
-      message: "One credit attempt authorized. No balance was changed."
-    };
-  });
-
-  return Response.json(result);
-  }
-    // TEST ONLY: Safely finalize a reserved reward-processing record.
-// This action never credits a balance.
-if (data.action === "finalize_reward_processing_test") {
-  const userId = String(data.user_id || "");
-  const ymid = String(data.ymid || "");
-
-  if (
-    !/^\d{1,25}$/.test(userId) ||
-    !/^ra_[A-Za-z0-9_-]{1,120}$/.test(ymid)
-  ) {
-    return respond({
-      ok: false,
-      error: "Invalid user ID or session ID",
-      reward_credited: false
-    }, 400);
-  }
-
-  const verifiedKey = `monetag:verified:${ymid}`;
-  const processingKey = `monetag:reward_processing:${ymid}`;
-
-  return await this.ctx.storage.transaction(async (txn) => {
-    const verified = await txn.get(verifiedKey);
-    const processing = await txn.get(processingKey);
-
-    if (
-      !verified ||
-      String(verified.user_id) !== userId ||
-      !processing ||
-      String(processing.user_id) !== userId
-    ) {
-      return respond({
-        ok: false,
-        finalized: false,
-        error: "Matching verified session or processing record not found",
-        reward_credited: false
-      }, 403);
-    }
-
-    if (processing.status === "test_finalized") {
-      return respond({
-        ok: true,
-        finalized: false,
-        duplicate: true,
-        status: "test_finalized",
-        reward_credited: false
-      });
-    }
-
-    if (processing.status !== "reserved") {
-      return respond({
-        ok: false,
-        finalized: false,
-        error: "Processing record is not in reserved status",
-        reward_credited: false
-      }, 409);
-    }
-
-    const now = Date.now();
-
-    await txn.put(processingKey, {
-      ...processing,
-      status: "test_finalized",
-      finalized_at: now,
-      reward_credited: false
+      payments: payments.results || []
     });
 
-    return respond({
-      ok: true,
-      finalized: true,
-      duplicate: false,
-      status: "test_finalized",
-      reward_credited: false,
-      message: "Test processing finalized. No balance was changed."
-    });
-  });
-          }
-    // TEST ONLY: Recover an interrupted reward-processing reservation.
-// This action never credits a balance.
-if (data.action === "recover_reward_processing_test") {
-  const userId = String(data.user_id || "");
-  const ymid = String(data.ymid || "");
-
-  if (
-    !/^\d{1,25}$/.test(userId) ||
-    !/^ra_[A-Za-z0-9_-]{1,120}$/.test(ymid)
-  ) {
-    return respond({
+  } catch (error) {
+    return jsonResponse({
       ok: false,
-      recovered: false,
-      error: "Invalid user ID or session ID",
-      reward_credited: false
+      error: error.message
     }, 400);
   }
+}
 
-  const verifiedKey = `monetag:verified:${ymid}`;
-  const processingKey = `monetag:reward_processing:${ymid}`;
+// ============================================================
+// CLAIM REWARD
+// ============================================================
 
-  return await this.ctx.storage.transaction(async (txn) => {
-    const verified = await txn.get(verifiedKey);
-    const processing = await txn.get(processingKey);
+async function handleClaimReward(request, env) {
+  try {
+    const { user } = await authenticateRequest(request, env);
+    const db = getDatabase(env);
 
-    if (
-      !verified ||
-      String(verified.user_id) !== userId ||
-      !processing ||
-      String(processing.user_id) !== userId
-    ) {
-      return respond({
+    if (!CONFIG.PAYOUTS_ENABLED) {
+      return jsonResponse({
         ok: false,
-        recovered: false,
-        error: "Matching verified session or processing record not found",
-        reward_credited: false
-      }, 403);
+        payouts_enabled: false,
+        error: "Payouts are temporarily disabled while Rapid Ads is being tested."
+      }, 503);
     }
 
-    if (processing.status === "test_recovered") {
-      return respond({
-        ok: true,
-        recovered: false,
-        duplicate: true,
-        status: "test_recovered",
-        reward_credited: false
-      });
+    const registeredUser = await getRegisteredUser(db, user.id);
+
+    if (!registeredUser?.faucetpay_email) {
+      throw new Error("Register your FaucetPay email first.");
     }
 
-    if (processing.status !== "reserved") {
-      return respond({
-        ok: false,
-        recovered: false,
-        error: "Only reserved records can be recovered",
-        status: processing.status,
-        reward_credited: false
-      }, 409);
-    }
+    // Payout processing has intentionally not been enabled.
+    // Do not turn PAYOUTS_ENABLED on until payment processing,
+    // idempotency, and failure handling are implemented and tested.
 
-    const now = Date.now();
-
-    await txn.put(processingKey, {
-      ...processing,
-      status: "test_recovered",
-      recovered_at: now,
-      reward_credited: false
-    });
-
-    return respond({
-      ok: true,
-      recovered: true,
-      duplicate: false,
-      status: "test_recovered",
-      reward_credited: false,
-      message: "Test reservation recovered. No balance was changed."
-    });
-  });
-      }
-   if (data.action === "inspect_session") {
-  const userId = String(data.user_id || "");
-  const ymid = String(data.ymid || "");
-
-  if (
-    !/^\d{1,25}$/.test(userId) ||
-    !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
-  ) {
-    return respond({
+    return jsonResponse({
       ok: false,
-      error: "Invalid user ID or session ID",
-      read_only: true
+      error: "FaucetPay payout processing is not implemented yet."
+    }, 501);
+
+  } catch (error) {
+    return jsonResponse({
+      ok: false,
+      error: error.message
     }, 400);
   }
-
-  const attempt = await this.ctx.storage.get(
-    `monetag:attempt:${ymid}`
-  );
-
-  const claim = await this.ctx.storage.get(
-    `monetag:claim:${ymid}`
-  );
-
-  const verified = await this.ctx.storage.get(
-    `monetag:verified:${ymid}`
-  );
-
-  return respond({
-    ok: true,
-    ymid: ymid,
-    user_id: userId,
-    attempt_found: Boolean(attempt),
-    claim_found: Boolean(claim),
-    verified_found: Boolean(verified),
-    attempt_matches_user: Boolean(
-      attempt && String(attempt.user_id) === userId
-    ),
-    claim_matches_user: Boolean(
-      claim && String(claim.user_id) === userId
-    ),
-    verified_matches_user: Boolean(
-      verified && String(verified.user_id) === userId
-    ),
-    reward_credited: false,
-    read_only: true
-  });
-    }
-        if (data.action === "inspect_reward_processing") {
-      const userId = String(data.user_id || "");
-      const ymid = String(data.ymid || "");
-
-      if (
-        !/^\d{1,25}$/.test(userId) ||
-        !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
-      ) {
-        return respond({
-          ok: false,
-          error: "Invalid user ID or session ID",
-          read_only: true
-        }, 400);
-      }
-
-      const verified = await this.ctx.storage.get(
-        `monetag:verified:${ymid}`
-      );
-
-      const processing = await this.ctx.storage.get(
-        `monetag:reward_processing:${ymid}`
-      );
-
-      if (
-        !verified ||
-        String(verified.user_id) !== userId ||
-        !processing ||
-        String(processing.user_id) !== userId
-      ) {
-        return respond({
-          ok: false,
-          found: false,
-          error: "Matching verified processing record not found",
-          read_only: true
-        });
-      }
-
-      return respond({
-        ok: true,
-        found: true,
-        user_id: userId,
-        ymid: ymid,
-        status: processing.status,
-        amount: processing.amount || 0,
-        currency: processing.currency || "USD",
-        reward_credited: processing.reward_credited === true,
-        credit_authorized_at:
-          processing.credit_authorized_at || null,
-        read_only: true
-      });
-      }
-        if (data.action === "claim_credit_execution_test") {
-      const userId = String(data.user_id || "");
-      const ymid = String(data.ymid || "");
-
-      if (
-        !/^\d{1,25}$/.test(userId) ||
-        !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid)
-      ) {
-        return respond({
-          ok: false,
-          error: "Invalid user ID or session ID",
-          test_only: true
-        }, 400);
-      }
-
-      const result = await this.ctx.storage.transaction(async (txn) => {
-        const processing = await txn.get(
-          `monetag:reward_processing:${ymid}`
-        );
-
-        if (!processing || String(processing.user_id) !== userId) {
-          return {
-            ok: false,
-            permitted: false,
-            error: "Matching processing record not found."
-          };
-        }
-
-        if (processing.status !== "crediting") {
-          return {
-            ok: true,
-            permitted: false,
-            duplicate: true,
-            status: processing.status,
-            message: "This session cannot receive another execution permit."
-          };
-        }
-
-        processing.status = "test_permit_issued";
-        processing.test_permit_issued_at = Date.now();
-        processing.reward_credited = false;
-
-        await txn.put(
-          `monetag:reward_processing:${ymid}`,
-          processing
-        );
-
-        return {
-          ok: true,
-          permitted: true,
-          duplicate: false,
-          status: "test_permit_issued",
-          amount: processing.amount,
-          currency: processing.currency,
-          reward_credited: false,
-          message: "Test permit issued. No balance was changed."
-        };
-      });
-
-      return respond({
-        ...result,
-        test_only: true
-      });
-  }
-    if (data.action === "validate_event") {
-      const session = data.session;
-      const event = data.event;
-
-      if (
-        !session ||
-        !event ||
-        typeof session !== "object" ||
-        typeof event !== "object"
-      ) {
-        return respond({
-          ok: false,
-          valid: false,
-          error: "Session and event records are required",
-          read_only: true
-        }, 400);
-      }
-
-      const sameUser =
-        String(session.user_id || "") !== "" &&
-        String(session.user_id) === String(event.user_id || "");
-
-      const sameYmid =
-        String(session.ymid || "") !== "" &&
-        String(session.ymid) === String(event.ymid || "");
-
-      const valuedEvent =
-        event.reward_event_type === "valued" &&
-        event.reward_eligible === true;
-
-      const notCredited =
-        event.credited === false;
-
-      const valid =
-        sameUser &&
-        sameYmid &&
-        valuedEvent &&
-        notCredited;
-
-      return respond({
-        ok: true,
-        valid: valid,
-        checks: {
-          session_user_matches_event: sameUser,
-          session_ymid_matches_event: sameYmid,
-          valued_event_is_eligible: valuedEvent,
-          event_not_already_credited: notCredited
-        },
-        read_only: true,
-        message: valid
-          ? "Event passed preliminary validation. No reward was credited."
-          : "Event failed one or more validation checks. No reward was credited."
-      });
-    }
-
-    return respond({
-      ok: false,
-      error: "Unsupported action",
-      read_only: true
-    }, 400);
-  }
-  }
+}
