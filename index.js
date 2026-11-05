@@ -913,8 +913,10 @@ if (paymentResult.status === "PAID") {
 
   return jsonResponse({
     ok: true,
-    duplicate: true,
-    payout_status: "PAID"
+    verified: true,
+    duplicate: false,
+    payout_status: "PAID",
+    payout_id: paymentResult.payout_id || null
   });
 }
 
