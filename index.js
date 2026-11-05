@@ -408,22 +408,28 @@ async function handleMonetagCooldown(request, env) {
     // --------------------------------------------------------
 
     if (action === "cancel_watch") {
-      const token = String(body.reservation_token || "");
+  const token = String(body.reservation_token || "");
 
-      if (!token) {
-        throw new Error("Reservation token is required.");
-      }
+  if (!token) {
+    throw new Error("Reservation token is required.");
+  }
 
-      const result = await db.prepare(`
-        DELETE FROM monetag_reservations
-        WHERE telegram_id = ?
-        AND reservation_token = ?
-      `).bind(user.id, token).run();
+  const result = await db.prepare(`
+    DELETE FROM monetag_reservations
+    WHERE telegram_id = ?
+      AND reservation_token = ?
+      AND NOT EXISTS (
+        SELECT 1
+        FROM monetag_sessions
+        WHERE monetag_sessions.telegram_id = ?
+          AND monetag_sessions.reservation_token = ?
+      )
+  `).bind(user.id, token, user.id, token).run();
 
-      return jsonResponse({
-        ok: true,
-        cancelled: Number(result.meta?.changes || 0) > 0
-      });
+  return jsonResponse({
+    ok: true,
+    cancelled: Number(result.meta?.changes || 0) > 0
+  });
     }
 
     // --------------------------------------------------------
