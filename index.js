@@ -806,9 +806,9 @@ async function handleMonetagPostback(request, env) {
     }
 
     const ymid = params.get("ymid");
-    const zone = params.get("zone");
-    const event = params.get("event");
-    const rewardType = params.get("reward_type");
+const zone = params.get("zone_id");
+const event = params.get("event_type");
+const rewardType = params.get("reward_event_type");
 
     if (!ymid || zone !== CONFIG.MONETAG_ZONE_ID) {
       throw new Error("Invalid Monetag postback details.");
