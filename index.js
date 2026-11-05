@@ -707,18 +707,16 @@ async function handleMonetagRegister(request, env) {
     const now = unixTime();
 
     const reservation = await db.prepare(`
-      SELECT reservation_token, expires_at
-      FROM monetag_reservations
-      WHERE telegram_id = ?
-    `).bind(user.id).first();
+  SELECT reservation_token
+  FROM monetag_reservations
+  WHERE telegram_id = ?
+    AND reservation_token = ?
+    AND expires_at >= ?
+`).bind(user.id, reservationToken, now).first();
 
-    if (
-      !reservation ||
-      reservation.reservation_token !== reservationToken ||
-      Number(reservation.expires_at) < now
-    ) {
-      throw new Error("Reservation is invalid or expired.");
-    }
+if (!reservation) {
+  throw new Error("Reservation is invalid or expired.");
+}
 
     const duplicate = await db.prepare(`
       SELECT id
@@ -732,27 +730,40 @@ async function handleMonetagRegister(request, env) {
 
     const id = randomId("monetag");
 
-    // Save the reservation token with the session.
-    // Do not delete the reservation here.
-    await db.prepare(`
-      INSERT INTO monetag_sessions (
-        id,
-        telegram_id,
-        ymid,
-        status,
-        reward_units,
-        created_at,
-        reservation_token
-      )
-      VALUES (?, ?, ?, 'PENDING', ?, ?, ?)
-    `).bind(
-      id,
-      user.id,
-      ymid,
-      CONFIG.MONETAG_REWARD_UNITS,
-      now,
-      reservationToken
-    ).run();
+    // Insert the session only if its reservation still exists and is valid.
+const insertResult = await db.prepare(`
+  INSERT INTO monetag_sessions (
+    id,
+    telegram_id,
+    ymid,
+    status,
+    reward_units,
+    created_at,
+    reservation_token
+  )
+  SELECT ?, ?, ?, 'PENDING', ?, ?, ?
+  WHERE EXISTS (
+    SELECT 1
+    FROM monetag_reservations
+    WHERE telegram_id = ?
+      AND reservation_token = ?
+      AND expires_at >= ?
+  )
+`).bind(
+  id,
+  user.id,
+  ymid,
+  CONFIG.MONETAG_REWARD_UNITS,
+  now,
+  reservationToken,
+  user.id,
+  reservationToken,
+  now
+).run();
+
+if (Number(insertResult.meta?.changes || 0) === 0) {
+  throw new Error("Reservation is invalid, expired, or cancelled.");
+}
 
     return jsonResponse({
       ok: true,
