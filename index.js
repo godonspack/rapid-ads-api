@@ -815,9 +815,9 @@ const rewardType = params.get("reward_event_type");
     }
 
     if (
-      event !== "impression" ||
-      rewardType !== "valued"
-    ) {
+  !["impression", "click"].includes(event) ||
+  rewardType !== "valued"
+) {
       return jsonResponse({
         ok: true,
         ignored: true,
