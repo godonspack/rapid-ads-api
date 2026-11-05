@@ -736,9 +736,10 @@ const insertResult = await db.prepare(`
     status,
     reward_units,
     created_at,
-    reservation_token
+    reservation_token,
+    faucetpay_email
   )
-  SELECT ?, ?, ?, 'PENDING', ?, ?, ?
+  SELECT ?, ?, ?, 'PENDING', ?, ?, ?, ?
   WHERE EXISTS (
     SELECT 1
     FROM monetag_reservations
@@ -753,6 +754,7 @@ const insertResult = await db.prepare(`
   CONFIG.MONETAG_REWARD_UNITS,
   now,
   reservationToken,
+  registeredUser.faucetpay_email,
   user.id,
   reservationToken,
   now
