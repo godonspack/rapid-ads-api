@@ -81,10 +81,6 @@ export default {
         return await handlePaymentHistory(request, env);
       }
 
-      if (path === "/claim-reward" && request.method === "POST") {
-        return await handleClaimReward(request, env);
-      }
-
       return jsonResponse({
         ok: false,
         error: "Route not found."
@@ -1005,42 +1001,6 @@ async function handlePaymentHistory(request, env) {
     }, 400);
   }
 }
-
-// ============================================================
-// CLAIM REWARD
-// ============================================================
-
-async function handleClaimReward(request, env) {
-  try {
-    const { user } = await authenticateRequest(request, env);
-    const db = getDatabase(env);
-
-    if (!CONFIG.PAYOUTS_ENABLED) {
-      return jsonResponse({
-        ok: false,
-        payouts_enabled: false,
-        error: "Payouts are temporarily disabled while Rapid Ads is being tested."
-      }, 503);
-    }
-
-    const registeredUser = await getRegisteredUser(db, user.id);
-
-    if (!registeredUser?.faucetpay_email) {
-      throw new Error("Register your FaucetPay email first.");
-    }
-
-    return jsonResponse({
-      ok: false,
-      error: "FaucetPay payout processing is not implemented yet."
-    }, 501);
-
-  } catch (error) {
-    return jsonResponse({
-      ok: false,
-      error: error.message
-    }, 400);
-  }
-    }
 
 // ==========================================
 // MONETAG REWARD COORDINATOR
