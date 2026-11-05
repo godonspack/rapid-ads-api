@@ -8,7 +8,8 @@ const CONFIG = {
 
   MONETAG_ZONE_ID: "12109194",
   MONETAG_REWARD_UNITS: 50000,
-  MONETAG_REWARD_CURRENCY: "USDT",
+MONETAG_REWARD_CURRENCY: "USDT",
+REWARD_UNITS_PER_USDT: 100000000,
   MONETAG_COOLDOWN_SECONDS: 60,
   MONETAG_DAILY_LIMIT: 100,
   MONETAG_RESERVATION_SECONDS: 600,
@@ -806,18 +807,18 @@ async function handleMonetagPostback(request, env) {
     }
 
     const ymid = params.get("ymid");
-const zone = params.get("zone_id");
-const event = params.get("event_type");
-const rewardType = params.get("reward_event_type");
+    const zone = params.get("zone_id");
+    const event = params.get("event_type");
+    const rewardType = params.get("reward_event_type");
 
     if (!ymid || zone !== CONFIG.MONETAG_ZONE_ID) {
       throw new Error("Invalid Monetag postback details.");
     }
 
     if (
-  !["impression", "click"].includes(event) ||
-  rewardType !== "valued"
-) {
+      !["impression", "click"].includes(event) ||
+      rewardType !== "valued"
+    ) {
       return jsonResponse({
         ok: true,
         ignored: true,
@@ -845,17 +846,68 @@ const rewardType = params.get("reward_event_type");
       });
     }
 
+    const rewardUnits = Number(session.reward_units);
+
+    if (
+      !Number.isSafeInteger(rewardUnits) ||
+      rewardUnits <= 0
+    ) {
+      throw new Error("Invalid reward amount.");
+    }
+
     const now = unixTime();
+    const rewardId = crypto.randomUUID();
 
-    const result = await db.prepare(`
-      UPDATE monetag_sessions
-      SET status = 'VERIFIED',
-          verified_at = ?
-      WHERE id = ?
-      AND status = 'PENDING'
-    `).bind(now, session.id).run();
+    // Insert the reward only if this session is still PENDING.
+    // Then mark the session VERIFIED in the same D1 batch.
+    const results = await db.batch([
+      db.prepare(`
+        INSERT INTO reward_ledger (
+          id,
+          telegram_id,
+          session_id,
+          amount_units,
+          currency,
+          created_at
+        )
+        SELECT ?, telegram_id, id, reward_units, ?, ?
+        FROM monetag_sessions
+        WHERE id = ?
+          AND status = 'PENDING'
+      `).bind(
+        rewardId,
+        CONFIG.MONETAG_REWARD_CURRENCY,
+        now,
+        session.id
+      ),
 
-    if (!result.meta?.changes) {
+      db.prepare(`
+        UPDATE monetag_sessions
+        SET status = 'VERIFIED',
+            verified_at = ?
+        WHERE id = ?
+          AND status = 'PENDING'
+          AND EXISTS (
+            SELECT 1
+            FROM reward_ledger
+            WHERE session_id = ?
+          )
+      `).bind(
+        now,
+        session.id,
+        session.id
+      )
+    ]);
+
+    const rewardInserted = Number(
+      results[0]?.meta?.changes || 0
+    );
+
+    const sessionUpdated = Number(
+      results[1]?.meta?.changes || 0
+    );
+
+    if (rewardInserted !== 1 || sessionUpdated !== 1) {
       return jsonResponse({
         ok: true,
         duplicate: true,
@@ -866,8 +918,8 @@ const rewardType = params.get("reward_event_type");
     return jsonResponse({
       ok: true,
       verified: true,
-      credited: false,
-      reward_units: session.reward_units,
+      credited: true,
+      reward_units: rewardUnits,
       currency: CONFIG.MONETAG_REWARD_CURRENCY
     });
 
