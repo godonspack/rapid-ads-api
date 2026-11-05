@@ -827,7 +827,12 @@ async function handleMonetagPostback(request, env) {
     const db = getDatabase(env);
 
     const session = await db.prepare(`
-      SELECT id, telegram_id, status, reward_units
+      SELECT
+        id,
+        telegram_id,
+        status,
+        reward_units,
+        faucetpay_email
       FROM monetag_sessions
       WHERE ymid = ?
     `).bind(ymid).first();
@@ -840,7 +845,7 @@ async function handleMonetagPostback(request, env) {
       return jsonResponse({
         ok: true,
         duplicate: true,
-        credited: false
+        status: session.status
       });
     }
 
@@ -848,83 +853,101 @@ async function handleMonetagPostback(request, env) {
 
     if (
       !Number.isSafeInteger(rewardUnits) ||
-      rewardUnits <= 0
+      rewardUnits !== CONFIG.MONETAG_REWARD_UNITS
     ) {
       throw new Error("Invalid reward amount.");
     }
 
     const now = unixTime();
-    const rewardId = crypto.randomUUID();
 
-    // Insert the reward only if this session is still PENDING.
-    // Then mark the session VERIFIED in the same D1 batch.
-    const results = await db.batch([
-      db.prepare(`
-        INSERT INTO reward_ledger (
-          id,
-          telegram_id,
-          session_id,
-          amount_units,
-          currency,
-          created_at
-        )
-        SELECT ?, telegram_id, id, reward_units, ?, ?
-        FROM monetag_sessions
-        WHERE id = ?
-          AND status = 'PENDING'
-      `).bind(
-        rewardId,
-        CONFIG.MONETAG_REWARD_CURRENCY,
-        now,
-        session.id
-      ),
-
-      db.prepare(`
+    // Payouts disabled: verify the event without attempting payment.
+    if (!CONFIG.PAYOUTS_ENABLED) {
+      await db.prepare(`
         UPDATE monetag_sessions
         SET status = 'VERIFIED',
             verified_at = ?
         WHERE id = ?
           AND status = 'PENDING'
-          AND EXISTS (
-            SELECT 1
-            FROM reward_ledger
-            WHERE session_id = ?
-          )
+      `).bind(now, session.id).run();
+
+      return jsonResponse({
+        ok: true,
+        verified: true,
+        payout_status: "DISABLED",
+        message: "Reward verified. Payouts are disabled."
+      });
+    }
+
+    // Make exactly one payout attempt for this session.
+    const paymentResult = await sendFaucetPayPayment(
+      db,
+      env,
+      session
+    );
+
+    if (paymentResult.status === "DUPLICATE") {
+      const existingPayment = await db.prepare(`
+        SELECT status
+        FROM payments
+        WHERE session_id = ?
+      `).bind(session.id).first();
+
+      const finalStatus =
+        existingPayment?.status === "PAID" ? "PAID" : "FAILED";
+
+      await db.prepare(`
+        UPDATE monetag_sessions
+        SET status = ?,
+            verified_at = ?,
+            paid_at = CASE WHEN ? = 'PAID' THEN ? ELSE paid_at END
+        WHERE id = ?
+          AND status = 'PENDING'
       `).bind(
+        finalStatus,
         now,
-        session.id,
+        finalStatus,
+        now,
         session.id
-      )
-    ]);
+      ).run();
 
-    const rewardInserted = Number(
-      results[0]?.meta?.changes || 0
-    );
-
-    const sessionUpdated = Number(
-      results[1]?.meta?.changes || 0
-    );
-
-    if (rewardInserted !== 1 || sessionUpdated !== 1) {
       return jsonResponse({
         ok: true,
         duplicate: true,
-        credited: false
+        payout_status: finalStatus
       });
     }
+
+    const finalStatus =
+      paymentResult.status === "PAID" ? "PAID" : "FAILED";
+
+    await db.prepare(`
+      UPDATE monetag_sessions
+      SET status = ?,
+          verified_at = ?,
+          paid_at = CASE WHEN ? = 'PAID' THEN ? ELSE paid_at END
+      WHERE id = ?
+        AND status = 'PENDING'
+    `).bind(
+      finalStatus,
+      now,
+      finalStatus,
+      now,
+      session.id
+    ).run();
 
     return jsonResponse({
       ok: true,
       verified: true,
-      credited: true,
-      reward_units: rewardUnits,
-      currency: CONFIG.MONETAG_REWARD_CURRENCY
+      payout_status: finalStatus,
+      payout_id: paymentResult.payout_id || null
     });
 
   } catch (error) {
+    console.error("Monetag postback error:", error);
+
     return jsonResponse({
       ok: false,
-      error: error.message
+      error: "Postback processing failed."
     }, 400);
   }
 }
