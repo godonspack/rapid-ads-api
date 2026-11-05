@@ -885,37 +885,38 @@ async function handleMonetagPostback(request, env) {
       session
     );
 
-    if (paymentResult.status === "DUPLICATE") {
-      const existingPayment = await db.prepare(`
-        SELECT status
-        FROM payments
-        WHERE session_id = ?
-      `).bind(session.id).first();
+    if (
+  paymentResult.status === "PROCESSING" ||
+  paymentResult.status === "DUPLICATE"
+) {
+  return jsonResponse({
+    ok: true,
+    duplicate: true,
+    payout_status: paymentResult.status,
+    message: "A payment attempt already exists. No second payment was sent."
+  });
+}
 
-      const finalStatus =
-        existingPayment?.status === "PAID" ? "PAID" : "FAILED";
+if (paymentResult.status === "PAID") {
+  await db.prepare(`
+    UPDATE monetag_sessions
+    SET status = 'PAID',
+        verified_at = COALESCE(verified_at, ?),
+        paid_at = ?
+    WHERE id = ?
+      AND status = 'PENDING'
+  `).bind(
+    now,
+    now,
+    session.id
+  ).run();
 
-      await db.prepare(`
-        UPDATE monetag_sessions
-        SET status = ?,
-            verified_at = ?,
-            paid_at = CASE WHEN ? = 'PAID' THEN ? ELSE paid_at END
-        WHERE id = ?
-          AND status = 'PENDING'
-      `).bind(
-        finalStatus,
-        now,
-        finalStatus,
-        now,
-        session.id
-      ).run();
-
-      return jsonResponse({
-        ok: true,
-        duplicate: true,
-        payout_status: finalStatus
-      });
-    }
+  return jsonResponse({
+    ok: true,
+    duplicate: true,
+    payout_status: "PAID"
+  });
+}
 
     const finalStatus =
       paymentResult.status === "PAID" ? "PAID" : "FAILED";
@@ -988,12 +989,10 @@ async function handlePaymentHistory(request, env) {
   }
 }
 async function sendFaucetPayPayment(db, env, session) {
-  // Never send payments while payouts are disabled.
   if (!CONFIG.PAYOUTS_ENABLED) {
     return {
       ok: false,
-      status: "DISABLED",
-      error: "Payouts are disabled."
+      status: "DISABLED"
     };
   }
 
@@ -1021,8 +1020,8 @@ async function sendFaucetPayPayment(db, env, session) {
   const paymentId = randomId("payment");
   const idempotencyKey = `rapid-ads-${session.id}`;
 
-  // Create the permanent attempt record BEFORE contacting FaucetPay.
-  // FAILED is the safe default if the Worker stops unexpectedly.
+  // Claim this session's single payment attempt.
+  // The unique session_id index prevents a second claim.
   const inserted = await db.prepare(`
     INSERT INTO payments (
       id,
@@ -1036,7 +1035,7 @@ async function sendFaucetPayPayment(db, env, session) {
       created_at,
       updated_at
     )
-    VALUES (?, ?, ?, ?, ?, 'FAILED', ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, 'PROCESSING', ?, ?, ?, ?)
     ON CONFLICT(session_id) DO NOTHING
   `).bind(
     paymentId,
@@ -1051,18 +1050,22 @@ async function sendFaucetPayPayment(db, env, session) {
   ).run();
 
   if (Number(inserted.meta?.changes || 0) !== 1) {
+    const existing = await db.prepare(`
+      SELECT status, faucetpay_reference
+      FROM payments
+      WHERE session_id = ?
+    `).bind(session.id).first();
+
     return {
-      ok: false,
-      status: "DUPLICATE",
-      error: "A payment attempt already exists for this session."
+      ok: existing?.status === "PAID",
+      status: existing?.status || "DUPLICATE",
+      payout_id: existing?.faucetpay_reference || null
     };
   }
 
-  let response;
-
   try {
     // Exactly one outbound request. Never retry this request.
-    response = await fetch(
+    const response = await fetch(
       `${CONFIG.FAUCETPAY_API_BASE}/send`,
       {
         method: "POST",
@@ -1080,38 +1083,40 @@ async function sendFaucetPayPayment(db, env, session) {
       }
     );
 
-    const result = await response.json();
+    let result;
+
+    try {
+      result = await response.json();
+    } catch {
+      result = null;
+    }
 
     if (
       response.ok &&
-      result.success === true &&
+      result?.success === true &&
       result.data?.payout_id
     ) {
-      await db.prepare(`
+      const payoutId = String(result.data.payout_id);
+
+      const update = await db.prepare(`
         UPDATE payments
         SET status = 'PAID',
             faucetpay_reference = ?,
             updated_at = ?
         WHERE id = ?
-          AND status = 'FAILED'
           AND session_id = ?
+          AND status = 'PROCESSING'
       `).bind(
-        String(result.data.payout_id),
+        payoutId,
         unixTime(),
         paymentId,
         session.id
       ).run();
 
-      const payment = await db.prepare(`
-        SELECT status
-        FROM payments
-        WHERE id = ?
-      `).bind(paymentId).first();
-
-      if (payment?.status !== "PAID") {
+      if (Number(update.meta?.changes || 0) !== 1) {
         return {
           ok: false,
-          status: "FAILED",
+          status: "PROCESSING",
           error: "Payment confirmation could not be recorded."
         };
       }
@@ -1119,9 +1124,20 @@ async function sendFaucetPayPayment(db, env, session) {
       return {
         ok: true,
         status: "PAID",
-        payout_id: String(result.data.payout_id)
+        payout_id: payoutId
       };
     }
+
+    await db.prepare(`
+      UPDATE payments
+      SET status = 'FAILED',
+          updated_at = ?
+      WHERE id = ?
+        AND status = 'PROCESSING'
+    `).bind(
+      unixTime(),
+      paymentId
+    ).run();
 
     return {
       ok: false,
@@ -1132,13 +1148,32 @@ async function sendFaucetPayPayment(db, env, session) {
   } catch (error) {
     console.error("FaucetPay payment error:", error);
 
+    // Best-effort failure recording. Never retry the payout.
+    try {
+      await db.prepare(`
+        UPDATE payments
+        SET status = 'FAILED',
+            updated_at = ?
+        WHERE id = ?
+          AND status = 'PROCESSING'
+      `).bind(
+        unixTime(),
+        paymentId
+      ).run();
+    } catch (databaseError) {
+      console.error(
+        "Could not record FaucetPay failure:",
+        databaseError
+      );
+    }
+
     return {
       ok: false,
       status: "FAILED",
       error: "Payment failed or its outcome is uncertain."
     };
   }
-  }
+        }
 // ==========================================
 // MONETAG REWARD COORDINATOR
 // READ-ONLY TEST VERSION
