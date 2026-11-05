@@ -57,6 +57,10 @@ export default {
         });
       }
 
+      if (path === "/balance" && request.method === "POST") {
+  return await handleBalance(request, env);
+    }
+      
       if (path === "/faucetpay-email" && request.method === "POST") {
         return await handleFaucetPayEmail(request, env);
       }
@@ -934,7 +938,41 @@ async function handleMonetagPostback(request, env) {
 // ============================================================
 // PAYMENT HISTORY
 // ============================================================
+async function handleBalance(request, env) {
+  try {
+    const { user } = await authenticateRequest(request, env);
+    const db = getDatabase(env);
 
+    const result = await db.prepare(`
+      SELECT COALESCE(SUM(amount_units), 0) AS balance_units
+      FROM reward_ledger
+      WHERE telegram_id = ?
+        AND currency = ?
+    `).bind(
+      user.id,
+      CONFIG.MONETAG_REWARD_CURRENCY
+    ).first();
+
+    const balanceUnits = Number(result?.balance_units || 0);
+
+    if (!Number.isSafeInteger(balanceUnits)) {
+      throw new Error("Invalid balance amount.");
+    }
+
+    return jsonResponse({
+      ok: true,
+      balance_units: balanceUnits,
+      balance: balanceUnits / CONFIG.REWARD_UNITS_PER_USDT,
+      currency: CONFIG.MONETAG_REWARD_CURRENCY
+    });
+
+  } catch (error) {
+    return jsonResponse({
+      ok: false,
+      error: error.message
+    }, 400);
+  }
+    }
 async function handlePaymentHistory(request, env) {
   try {
     const { user } = await authenticateRequest(request, env);
