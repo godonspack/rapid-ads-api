@@ -964,7 +964,158 @@ async function handlePaymentHistory(request, env) {
     }, 400);
   }
 }
+async function sendFaucetPayPayment(db, env, session) {
+  // Never send payments while payouts are disabled.
+  if (!CONFIG.PAYOUTS_ENABLED) {
+    return {
+      ok: false,
+      status: "DISABLED",
+      error: "Payouts are disabled."
+    };
+  }
 
+  if (!env.FAUCETPAY_API_KEY) {
+    return {
+      ok: false,
+      status: "FAILED",
+      error: "FaucetPay API key is not configured."
+    };
+  }
+
+  const email = String(session.faucetpay_email || "")
+    .trim()
+    .toLowerCase();
+
+  if (!email || !session.id || !session.telegram_id) {
+    return {
+      ok: false,
+      status: "FAILED",
+      error: "Invalid payment details."
+    };
+  }
+
+  const now = unixTime();
+  const paymentId = randomId("payment");
+  const idempotencyKey = `rapid-ads-${session.id}`;
+
+  // Create the permanent attempt record BEFORE contacting FaucetPay.
+  // FAILED is the safe default if the Worker stops unexpectedly.
+  const inserted = await db.prepare(`
+    INSERT INTO payments (
+      id,
+      telegram_id,
+      faucetpay_email,
+      amount_units,
+      currency,
+      status,
+      idempotency_key,
+      session_id,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, 'FAILED', ?, ?, ?, ?)
+    ON CONFLICT(session_id) DO NOTHING
+  `).bind(
+    paymentId,
+    session.telegram_id,
+    email,
+    CONFIG.MONETAG_REWARD_UNITS,
+    CONFIG.MONETAG_REWARD_CURRENCY,
+    idempotencyKey,
+    session.id,
+    now,
+    now
+  ).run();
+
+  if (Number(inserted.meta?.changes || 0) !== 1) {
+    return {
+      ok: false,
+      status: "DUPLICATE",
+      error: "A payment attempt already exists for this session."
+    };
+  }
+
+  let response;
+
+  try {
+    // Exactly one outbound request. Never retry this request.
+    response = await fetch(
+      `${CONFIG.FAUCETPAY_API_BASE}/send`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${env.FAUCETPAY_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          idempotency_key: idempotencyKey,
+          to: email,
+          amount: CONFIG.MONETAG_REWARD_UNITS,
+          currency: CONFIG.MONETAG_REWARD_CURRENCY
+        }),
+        signal: AbortSignal.timeout(15000)
+      }
+    );
+
+    const result = await response.json();
+
+    if (
+      response.ok &&
+      result.success === true &&
+      result.data?.payout_id
+    ) {
+      await db.prepare(`
+        UPDATE payments
+        SET status = 'PAID',
+            faucetpay_reference = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND status = 'FAILED'
+          AND session_id = ?
+      `).bind(
+        String(result.data.payout_id),
+        unixTime(),
+        paymentId,
+        session.id
+      ).run();
+
+      const payment = await db.prepare(`
+        SELECT status
+        FROM payments
+        WHERE id = ?
+      `).bind(paymentId).first();
+
+      if (payment?.status !== "PAID") {
+        return {
+          ok: false,
+          status: "FAILED",
+          error: "Payment confirmation could not be recorded."
+        };
+      }
+
+      return {
+        ok: true,
+        status: "PAID",
+        payout_id: String(result.data.payout_id)
+      };
+    }
+
+    return {
+      ok: false,
+      status: "FAILED",
+      error: "FaucetPay did not confirm the payment."
+    };
+
+  } catch (error) {
+    console.error("FaucetPay payment error:", error);
+
+    return {
+      ok: false,
+      status: "FAILED",
+      error: "Payment failed or its outcome is uncertain."
+    };
+  }
+  }
 // ==========================================
 // MONETAG REWARD COORDINATOR
 // READ-ONLY TEST VERSION
