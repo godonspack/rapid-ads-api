@@ -916,62 +916,83 @@ const now = unixTime();
       });
     }
 
-    // Make exactly one payout attempt for this session.
+        // Make exactly one payout attempt for this session.
     const paymentResult = await sendFaucetPayPayment(
       db,
       env,
       session
     );
 
+    // An existing attempt must never trigger another payment.
     if (
-  paymentResult.status === "PROCESSING" ||
-  paymentResult.status === "DUPLICATE"
-) {
-  return jsonResponse({
-    ok: true,
-    duplicate: true,
-    payout_status: paymentResult.status,
-    message: "A payment attempt already exists. No second payment was sent."
-  });
-}
+      paymentResult.status === "PROCESSING" ||
+      paymentResult.status === "DUPLICATE"
+    ) {
+      return jsonResponse({
+        ok: true,
+        duplicate: true,
+        payout_status: paymentResult.status,
+        message: "A payment attempt already exists. No second payment was sent."
+      });
+    }
 
-if (paymentResult.status === "PAID") {
-  await db.prepare(`
-    UPDATE monetag_sessions
-    SET status = 'PAID',
-        verified_at = COALESCE(verified_at, ?),
-        paid_at = ?
-    WHERE id = ?
-      AND status = 'PENDING'
-  `).bind(
-    now,
-    now,
-    session.id
-  ).run();
+    // A confirmed payment.
+    if (paymentResult.status === "PAID") {
+      await db.prepare(`
+        UPDATE monetag_sessions
+        SET status = 'PAID',
+            verified_at = COALESCE(verified_at, ?),
+            paid_at = ?
+        WHERE id = ?
+          AND status = 'PENDING'
+      `).bind(
+        now,
+        now,
+        session.id
+      ).run();
 
-  return jsonResponse({
-    ok: true,
-    verified: true,
-    duplicate: false,
-    payout_status: "PAID",
-    payout_id: paymentResult.payout_id || null
-  });
-}
+      return jsonResponse({
+        ok: true,
+        verified: true,
+        duplicate: false,
+        payout_status: "PAID",
+        payout_id: paymentResult.payout_id || null
+      });
+    }
 
-    const finalStatus =
-      paymentResult.status === "PAID" ? "PAID" : "FAILED";
+    // Payouts disabled: do not mark the session as failed.
+    // This is a development safeguard, not a failed payment.
+    if (paymentResult.status === "DISABLED") {
+      return jsonResponse({
+        ok: true,
+        verified: true,
+        payout_status: "DISABLED",
+        message: "Reward verified. Payouts are disabled."
+      });
+    }
+
+    // A failed or uncertain payment attempt is final.
+    if (paymentResult.status !== "FAILED") {
+      console.error(
+        "Unexpected FaucetPay payment status:",
+        paymentResult.status
+      );
+
+      return jsonResponse({
+        ok: false,
+        verified: true,
+        payout_status: "UNKNOWN",
+        error: "Unexpected payment status. No retry was attempted."
+      }, 500);
+    }
 
     await db.prepare(`
       UPDATE monetag_sessions
-      SET status = ?,
-          verified_at = ?,
-          paid_at = CASE WHEN ? = 'PAID' THEN ? ELSE paid_at END
+      SET status = 'FAILED',
+          verified_at = ?
       WHERE id = ?
         AND status = 'PENDING'
     `).bind(
-      finalStatus,
-      now,
-      finalStatus,
       now,
       session.id
     ).run();
@@ -979,11 +1000,10 @@ if (paymentResult.status === "PAID") {
     return jsonResponse({
       ok: true,
       verified: true,
-      payout_status: finalStatus,
-      payout_id: paymentResult.payout_id || null
+      payout_status: "FAILED",
+      message: "Payment failed or its outcome is uncertain. No retry will be attempted."
     });
-
-  } catch (error) {
+    } catch (error) {
     console.error("Monetag postback error:", error);
 
     return jsonResponse({
@@ -991,7 +1011,7 @@ if (paymentResult.status === "PAID") {
       error: "Postback processing failed."
     }, 400);
   }
-}
+      }
 
 // ============================================================
 // PAYMENT HISTORY
