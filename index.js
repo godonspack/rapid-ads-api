@@ -501,15 +501,17 @@ async function handleMonetagCooldown(request, env) {
     DO UPDATE SET
       session_id = excluded.session_id,
       finished_at = excluded.finished_at
-    WHERE (
-      SELECT rowid
-      FROM monetag_sessions
-      WHERE id = excluded.session_id
-    ) > (
-      SELECT rowid
-      FROM monetag_sessions
-      WHERE id = monetag_cooldowns.session_id
-    )
+    WHERE
+  monetag_cooldowns.session_id = excluded.session_id
+  OR (
+    SELECT rowid
+    FROM monetag_sessions
+    WHERE id = excluded.session_id
+  ) > (
+    SELECT rowid
+    FROM monetag_sessions
+    WHERE id = monetag_cooldowns.session_id
+  )
   `).bind(
     user.id,
     session.id,
