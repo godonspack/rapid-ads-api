@@ -442,10 +442,15 @@ async function handleMonetagCooldown(request, env) {
       }
 
       const session = await db.prepare(`
-  SELECT id, status, reservation_token, created_at
+  SELECT
+    id,
+    status,
+    reservation_token,
+    created_at,
+    rowid AS session_order
   FROM monetag_sessions
   WHERE telegram_id = ?
-  AND ymid = ?
+    AND ymid = ?
 `).bind(user.id, ymid).first();
 
       if (!session) {
@@ -488,7 +493,8 @@ const latestCooldown = await db.prepare(`
   SELECT
     mc.session_id,
     mc.finished_at,
-    ms.created_at
+    ms.created_at,
+    ms.rowid AS session_order
   FROM monetag_cooldowns mc
   JOIN monetag_sessions ms
     ON ms.id = mc.session_id
@@ -496,15 +502,15 @@ const latestCooldown = await db.prepare(`
 `).bind(user.id).first();
 
 if (latestCooldown) {
-  const currentSessionCreatedAt = Number(
-    latestCooldown.created_at
-  );
+  const currentSessionOrder = Number(
+  latestCooldown.session_order
+);
 
-  const incomingSessionCreatedAt = Number(
-    session.created_at
-  );
+const incomingSessionOrder = Number(
+  session.session_order
+);
 
-  if (currentSessionCreatedAt > incomingSessionCreatedAt) {
+if (currentSessionOrder > incomingSessionOrder) {
     const currentRemaining = Math.max(
       0,
       CONFIG.MONETAG_COOLDOWN_SECONDS -
@@ -645,20 +651,38 @@ await db.prepare(`
 
     const token = randomId("reservation");
 
-    await db.prepare(`
-      INSERT INTO monetag_reservations (
-        telegram_id,
-        reservation_token,
-        expires_at,
-        created_at
-      )
-      VALUES (?, ?, ?, ?)
-    `).bind(
-      user.id,
-      token,
-      now + CONFIG.MONETAG_RESERVATION_SECONDS,
-      now
-    ).run();
+    try {
+  await db.prepare(`
+    INSERT INTO monetag_reservations (
+      telegram_id,
+      reservation_token,
+      expires_at,
+      created_at
+    )
+    VALUES (?, ?, ?, ?)
+  `).bind(
+    user.id,
+    token,
+    now + CONFIG.MONETAG_RESERVATION_SECONDS,
+    now
+  ).run();
+
+} catch (error) {
+  const message = String(error.message || "");
+
+  if (
+    message.includes("UNIQUE constraint failed") ||
+    message.includes("constraint failed")
+  ) {
+    return jsonResponse({
+      ok: false,
+      can_watch: false,
+      error: "A watch reservation is already active."
+    }, 409);
+  }
+
+  throw error;
+    }
 
     return jsonResponse({
       ok: true,
