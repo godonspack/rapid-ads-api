@@ -387,7 +387,35 @@ async function getMonetagCooldown(db, telegramId) {
     (unixTime() - Number(latest.finished_at))
   );
 }
+async function ensureMonetagCooldown(db, session) {
+  const now = unixTime();
 
+  await db.prepare(`
+    INSERT INTO monetag_cooldowns (
+      telegram_id,
+      session_id,
+      finished_at
+    )
+    VALUES (?, ?, ?)
+    ON CONFLICT(telegram_id)
+    DO UPDATE SET
+      session_id = excluded.session_id,
+      finished_at = excluded.finished_at
+    WHERE (
+      SELECT rowid
+      FROM monetag_sessions
+      WHERE id = excluded.session_id
+    ) > (
+      SELECT rowid
+      FROM monetag_sessions
+      WHERE id = monetag_cooldowns.session_id
+    )
+  `).bind(
+    session.telegram_id,
+    session.id,
+    now
+  ).run();
+}
 // ============================================================
 // MONETAG COOLDOWN ACTIONS
 // ============================================================
@@ -434,135 +462,97 @@ async function handleMonetagCooldown(request, env) {
     // --------------------------------------------------------
 
     if (action === "finish_watch") {
-      const token = String(body.reservation_token || "");
-      const ymid = String(body.ymid || "");
+  const token = String(body.reservation_token || "");
+  const ymid = String(body.ymid || "");
 
-      if (!token || !ymid) {
-        throw new Error("Reservation token and session ID are required.");
-      }
-
-      const session = await db.prepare(`
-  SELECT
-    id,
-    status,
-    reservation_token,
-    created_at,
-    rowid AS session_order
-  FROM monetag_sessions
-  WHERE telegram_id = ?
-    AND ymid = ?
-`).bind(user.id, ymid).first();
-
-      if (!session) {
-        throw new Error("Monetag session not found.");
-      }
-
-      // Validate the token saved during registration.
-      if (session.reservation_token !== token) {
-        throw new Error("Reservation token does not match this session.");
-      }
-
-      // If this session was already finished, return its status.
-      const existingCooldown = await db.prepare(`
-        SELECT finished_at
-        FROM monetag_cooldowns
-        WHERE telegram_id = ?
-        AND session_id = ?
-      `).bind(user.id, session.id).first();
-
-      if (existingCooldown) {
-        const remaining = Math.max(
-          0,
-          CONFIG.MONETAG_COOLDOWN_SECONDS -
-          (now - Number(existingCooldown.finished_at))
-        );
-
-        return jsonResponse({
-          ok: true,
-          cooldown_started: true,
-          cooldown_seconds: CONFIG.MONETAG_COOLDOWN_SECONDS,
-          remaining_seconds: remaining,
-          attempt_recorded: true,
-          reward_credited: false,
-          reward_eligible_for_review: session.status === "VERIFIED"
-        });
-      }
-
-      // Prevent an older session from overwriting a newer cooldown.
-const latestCooldown = await db.prepare(`
-  SELECT
-    mc.session_id,
-    mc.finished_at,
-    ms.created_at,
-    ms.rowid AS session_order
-  FROM monetag_cooldowns mc
-  JOIN monetag_sessions ms
-    ON ms.id = mc.session_id
-  WHERE mc.telegram_id = ?
-`).bind(user.id).first();
-
-if (latestCooldown) {
-  const currentSessionOrder = Number(
-  latestCooldown.session_order
-);
-
-const incomingSessionOrder = Number(
-  session.session_order
-);
-
-if (currentSessionOrder > incomingSessionOrder) {
-    const currentRemaining = Math.max(
-      0,
-      CONFIG.MONETAG_COOLDOWN_SECONDS -
-      (now - Number(latestCooldown.finished_at))
-    );
-
-    return jsonResponse({
-      ok: true,
-      cooldown_started: true,
-      cooldown_seconds: CONFIG.MONETAG_COOLDOWN_SECONDS,
-      remaining_seconds: currentRemaining,
-      attempt_recorded: true,
-      reward_credited: false,
-      reward_eligible_for_review: false
-    });
+  if (!token || !ymid) {
+    throw new Error("Reservation token and session ID are required.");
   }
-}
 
-// Start or update the user's cooldown.
-await db.prepare(`
-  INSERT INTO monetag_cooldowns (
-    telegram_id,
-    session_id,
-    finished_at
-  )
-  VALUES (?, ?, ?)
-  ON CONFLICT(telegram_id)
-  DO UPDATE SET
-    session_id = excluded.session_id,
-    finished_at = excluded.finished_at
-`).bind(
-  user.id,
-  session.id,
-  now
-).run();
+  const session = await db.prepare(`
+    SELECT
+      id,
+      status,
+      reservation_token
+    FROM monetag_sessions
+    WHERE telegram_id = ?
+      AND ymid = ?
+  `).bind(user.id, ymid).first();
 
-      // Remove the reservation after successful completion.
-      await db.prepare(`
-        DELETE FROM monetag_reservations
-        WHERE telegram_id = ?
-        AND reservation_token = ?
-      `).bind(user.id, token).run();
+  if (!session) {
+    throw new Error("Monetag session not found.");
+  }
 
-      return jsonResponse({
-        ok: true,
-        cooldown_started: true,
-        cooldown_seconds: CONFIG.MONETAG_COOLDOWN_SECONDS,
-        remaining_seconds: CONFIG.MONETAG_COOLDOWN_SECONDS,
-        attempt_recorded: true,
-        reward_credited: false,
-        reward_eligible_for_review: session.status === "VERIFIED"
-      });
+  if (session.reservation_token !== token) {
+    throw new Error("Reservation token does not match this session.");
+  }
+
+  // Atomically insert or update the cooldown.
+  // A session can never restart its own cooldown.
+  // An older session cannot overwrite a newer session.
+  await db.prepare(`
+    INSERT INTO monetag_cooldowns (
+      telegram_id,
+      session_id,
+      finished_at
+    )
+    VALUES (?, ?, ?)
+    ON CONFLICT(telegram_id)
+    DO UPDATE SET
+      session_id = excluded.session_id,
+      finished_at = excluded.finished_at
+    WHERE (
+      SELECT rowid
+      FROM monetag_sessions
+      WHERE id = excluded.session_id
+    ) > (
+      SELECT rowid
+      FROM monetag_sessions
+      WHERE id = monetag_cooldowns.session_id
+    )
+  `).bind(
+    user.id,
+    session.id,
+    now
+  ).run();
+
+  // Read the actual cooldown currently recorded for this user.
+  const cooldown = await db.prepare(`
+    SELECT
+      mc.session_id,
+      mc.finished_at
+    FROM monetag_cooldowns mc
+    WHERE mc.telegram_id = ?
+  `).bind(user.id).first();
+
+  if (!cooldown) {
+    throw new Error("Unable to record Monetag cooldown.");
+  }
+
+  // Remove this session's reservation.
+  await db.prepare(`
+    DELETE FROM monetag_reservations
+    WHERE telegram_id = ?
+      AND reservation_token = ?
+  `).bind(user.id, token).run();
+
+  const remaining = Math.max(
+    0,
+    CONFIG.MONETAG_COOLDOWN_SECONDS -
+    (now - Number(cooldown.finished_at))
+  );
+
+  return jsonResponse({
+    ok: true,
+    cooldown_started: true,
+    cooldown_seconds: CONFIG.MONETAG_COOLDOWN_SECONDS,
+    remaining_seconds: remaining,
+    attempt_recorded: true,
+    reward_credited: false,
+    reward_eligible_for_review:
+      cooldown.session_id === session.id &&
+      session.status === "VERIFIED"
+  });
     }
 
     if (action !== "check_cooldown" && action !== "reserve_watch") {
