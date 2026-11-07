@@ -677,7 +677,7 @@ try {
   `).bind(
     user.id,
     token,
-    now + CONFIG.MONETAG_RESERVATION_SECONDS * 1000,
+    now + CONFIG.MONETAG_RESERVATION_SECONDS,
     now
   ).run();
 
@@ -697,7 +697,19 @@ try {
 
   throw error;
 }
-
+return jsonResponse({
+  ok: true,
+  can_watch: true,
+  reservation_token: token,
+  remaining_seconds: 0
+});
+} catch (error) {
+    return jsonResponse({
+      ok: false,
+      error: error.message
+    }, 400);
+  }
+}
 // ============================================================
 // REGISTER MONETAG SESSION
 // ============================================================
