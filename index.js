@@ -855,24 +855,27 @@ async function handleMonetagPostback(request, env) {
       throw new Error("Monetag session not found.");
     }
 
-    if (session.status !== "PENDING") {
-      return jsonResponse({
-        ok: true,
-        duplicate: true,
-        status: session.status
-      });
-    }
-
     const rewardUnits = Number(session.reward_units);
 
-    if (
-      !Number.isSafeInteger(rewardUnits) ||
-      rewardUnits !== CONFIG.MONETAG_REWARD_UNITS
-    ) {
-      throw new Error("Invalid reward amount.");
-    }
+if (
+  !Number.isSafeInteger(rewardUnits) ||
+  rewardUnits !== CONFIG.MONETAG_REWARD_UNITS
+) {
+  throw new Error("Invalid reward amount.");
+}
 
-    const now = unixTime();
+// Ensure the cooldown exists without restarting an existing session's timer.
+await ensureMonetagCooldown(db, session);
+
+if (session.status !== "PENDING") {
+  return jsonResponse({
+    ok: true,
+    duplicate: true,
+    status: session.status
+  });
+}
+
+const now = unixTime();
 
     // Payouts disabled: verify the event without attempting payment.
     if (!CONFIG.PAYOUTS_ENABLED) {
