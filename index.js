@@ -12,7 +12,7 @@ MONETAG_REWARD_CURRENCY: "USDT",
 REWARD_UNITS_PER_USDT: 100000000,
   MONETAG_COOLDOWN_SECONDS: 60,
   MONETAG_DAILY_LIMIT: 100,
-  MONETAG_RESERVATION_SECONDS: 600,
+  MONETAG_RESERVATION_SECONDS: 120,
 
   FAUCETPAY_API_BASE: "https://faucetpay.io/api/v2",
 
@@ -619,31 +619,53 @@ async function handleMonetagCooldown(request, env) {
     // --------------------------------------------------------
 
     const existingReservation = await db.prepare(`
-      SELECT reservation_token, expires_at
-      FROM monetag_reservations
-      WHERE telegram_id = ?
-    `).bind(user.id).first();
+  SELECT reservation_token, expires_at
+  FROM monetag_reservations
+  WHERE telegram_id = ?
+`).bind(user.id).first();
 
-    if (
-      existingReservation &&
-      Number(existingReservation.expires_at) >= now
-    ) {
-      return jsonResponse({
-        ok: false,
-        can_watch: false,
-        error: "A watch reservation is already active."
-      }, 409);
-    }
+if (
+  existingReservation &&
+  Number(existingReservation.expires_at) >= now
+) {
+  const existingSession = await db.prepare(`
+    SELECT id
+    FROM monetag_sessions
+    WHERE telegram_id = ?
+      AND reservation_token = ?
+    LIMIT 1
+  `).bind(
+    user.id,
+    existingReservation.reservation_token
+  ).first();
 
-    await db.prepare(`
-      DELETE FROM monetag_reservations
-      WHERE telegram_id = ?
-      AND expires_at < ?
-    `).bind(user.id, now).run();
+  if (!existingSession) {
+    return jsonResponse({
+      ok: true,
+      can_watch: true,
+      reservation_token: existingReservation.reservation_token,
+      remaining_seconds: 0,
+      reservation_reused: true,
+      message: "Your previous unused reservation has been recovered."
+    });
+  }
 
-    const token = randomId("reservation");
+  return jsonResponse({
+    ok: false,
+    can_watch: false,
+    error: "An advertisement session is already registered. Please wait for it to finish."
+  }, 409);
+}
 
-    try {
+await db.prepare(`
+  DELETE FROM monetag_reservations
+  WHERE telegram_id = ?
+    AND expires_at < ?
+`).bind(user.id, now).run();
+
+const token = randomId("reservation");
+
+try {
   await db.prepare(`
     INSERT INTO monetag_reservations (
       telegram_id,
@@ -655,7 +677,7 @@ async function handleMonetagCooldown(request, env) {
   `).bind(
     user.id,
     token,
-    now + CONFIG.MONETAG_RESERVATION_SECONDS,
+    now + CONFIG.MONETAG_RESERVATION_SECONDS * 1000,
     now
   ).run();
 
@@ -674,21 +696,6 @@ async function handleMonetagCooldown(request, env) {
   }
 
   throw error;
-    }
-
-    return jsonResponse({
-      ok: true,
-      can_watch: true,
-      reservation_token: token,
-      remaining_seconds: 0
-    });
-
-  } catch (error) {
-    return jsonResponse({
-      ok: false,
-      error: error.message
-    }, 400);
-  }
 }
 
 // ============================================================
