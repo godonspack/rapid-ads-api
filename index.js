@@ -1042,9 +1042,11 @@ async function handlePaymentHistory(request, env) {
     });
 
   } catch (error) {
+    console.error("Payment history error:", error);
+
     return jsonResponse({
       ok: false,
-      error: error.message
+      error: "Unable to retrieve payment history."
     }, 400);
   }
 }
