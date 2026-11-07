@@ -1029,6 +1029,7 @@ async function handlePaymentHistory(request, env) {
   }
 }
 async function sendFaucetPayPayment(db, env, session) {
+  // Development safety: do not create payment records or send payments.
   if (!CONFIG.PAYOUTS_ENABLED) {
     return {
       ok: false,
@@ -1036,19 +1037,11 @@ async function sendFaucetPayPayment(db, env, session) {
     };
   }
 
-  if (!env.FAUCETPAY_API_KEY) {
-    return {
-      ok: false,
-      status: "FAILED",
-      error: "FaucetPay API key is not configured."
-    };
-  }
-
-  const email = String(session.faucetpay_email || "")
+  const email = String(session?.faucetpay_email || "")
     .trim()
     .toLowerCase();
 
-  if (!email || !session.id || !session.telegram_id) {
+  if (!email || !session?.id || !session?.telegram_id) {
     return {
       ok: false,
       status: "FAILED",
@@ -1060,8 +1053,7 @@ async function sendFaucetPayPayment(db, env, session) {
   const paymentId = randomId("payment");
   const idempotencyKey = `rapid-ads-${session.id}`;
 
-  // Claim this session's single payment attempt.
-  // The unique session_id index prevents a second claim.
+  // Claim this session's one and only payment attempt.
   const inserted = await db.prepare(`
     INSERT INTO payments (
       id,
@@ -1089,6 +1081,7 @@ async function sendFaucetPayPayment(db, env, session) {
     now
   ).run();
 
+  // A payment record already exists: never send another payment.
   if (Number(inserted.meta?.changes || 0) !== 1) {
     const existing = await db.prepare(`
       SELECT status, faucetpay_reference
@@ -1104,7 +1097,29 @@ async function sendFaucetPayPayment(db, env, session) {
   }
 
   try {
-    // Exactly one outbound request. Never retry this request.
+    // Record a missing API key as a failed attempt.
+    if (!env.FAUCETPAY_API_KEY) {
+      await db.prepare(`
+        UPDATE payments
+        SET status = 'FAILED',
+            updated_at = ?
+        WHERE id = ?
+          AND session_id = ?
+          AND status = 'PROCESSING'
+      `).bind(
+        unixTime(),
+        paymentId,
+        session.id
+      ).run();
+
+      return {
+        ok: false,
+        status: "FAILED",
+        error: "FaucetPay API key is not configured."
+      };
+    }
+
+    // Exactly one outbound payment request. Never retry it.
     const response = await fetch(
       `${CONFIG.FAUCETPAY_API_BASE}/send`,
       {
@@ -1154,11 +1169,9 @@ async function sendFaucetPayPayment(db, env, session) {
       ).run();
 
       if (Number(update.meta?.changes || 0) !== 1) {
-        return {
-          ok: false,
-          status: "PROCESSING",
-          error: "Payment confirmation could not be recorded."
-        };
+        throw new Error(
+          "FaucetPay confirmed payment, but D1 did not record PAID."
+        );
       }
 
       return {
@@ -1168,15 +1181,18 @@ async function sendFaucetPayPayment(db, env, session) {
       };
     }
 
+    // FaucetPay did not confirm the payment.
     await db.prepare(`
       UPDATE payments
       SET status = 'FAILED',
           updated_at = ?
       WHERE id = ?
+        AND session_id = ?
         AND status = 'PROCESSING'
     `).bind(
       unixTime(),
-      paymentId
+      paymentId,
+      session.id
     ).run();
 
     return {
@@ -1188,18 +1204,22 @@ async function sendFaucetPayPayment(db, env, session) {
   } catch (error) {
     console.error("FaucetPay payment error:", error);
 
-    // Best-effort failure recording. Never retry the payout.
+    // Best-effort failure recording.
+    // Never send another payment request for this session.
     try {
       await db.prepare(`
         UPDATE payments
         SET status = 'FAILED',
             updated_at = ?
         WHERE id = ?
+          AND session_id = ?
           AND status = 'PROCESSING'
       `).bind(
         unixTime(),
-        paymentId
+        paymentId,
+        session.id
       ).run();
+
     } catch (databaseError) {
       console.error(
         "Could not record FaucetPay failure:",
@@ -1213,7 +1233,7 @@ async function sendFaucetPayPayment(db, env, session) {
       error: "Payment failed or its outcome is uncertain."
     };
   }
-        }
+      }
 // ==========================================
 // MONETAG REWARD COORDINATOR
 // READ-ONLY TEST VERSION
