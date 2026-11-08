@@ -78,8 +78,8 @@ export default {
       }
 
       if (path === "/faucetpay-config-check" && request.method === "POST") {
-  return await handleFaucetPayConfigCheck(request, env);
-     }
+        return await handleFaucetPayConfigCheck(request, env);
+      }
       return jsonResponse({
         ok: false,
         error: "Route not found."
