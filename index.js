@@ -604,7 +604,24 @@ async function handleMonetagCooldown(request, env) {
         error: "Register your FaucetPay email before watching ads."
       }, 403);
     }
+    // Block reservations while an earlier payment is unresolved.
+    const unresolvedPayment = await db.prepare(`
+      SELECT p.id
+      FROM payments p
+      INNER JOIN monetag_sessions ms
+        ON ms.id = p.session_id
+      WHERE ms.telegram_id = ?
+        AND p.status IN ('PROCESSING', 'UNKNOWN')
+      LIMIT 1
+    `).bind(user.id).first();
 
+    if (unresolvedPayment) {
+      return jsonResponse({
+        ok: false,
+        can_watch: false,
+        error: "You have an unresolved payment. Please wait for reconciliation before starting another ad session."
+      }, 409);
+    }
     // --------------------------------------------------------
     // DAILY LIMIT AND COOLDOWN
     // --------------------------------------------------------
