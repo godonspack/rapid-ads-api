@@ -875,7 +875,25 @@ async function handleMonetagPostback(request, env) {
     if (!session) {
       throw new Error("Monetag session not found.");
     }
+    // Temporary live-payment test restriction.
+    // Only the approved Telegram account may trigger a FaucetPay payout.
+    if (CONFIG.PAYOUTS_ENABLED) {
+      const allowedTelegramId = String(
+        env.FAUCETPAY_TEST_TELEGRAM_ID || ""
+      ).trim();
 
+      if (
+        !allowedTelegramId ||
+        String(session.telegram_id) !== allowedTelegramId
+      ) {
+        return jsonResponse({
+          ok: true,
+          ignored: true,
+          payout_status: "TEST_RESTRICTED",
+          message: "This account is not authorised for the temporary payout test."
+        });
+      }
+      }
     const rewardUnits = Number(session.reward_units);
 
 if (
