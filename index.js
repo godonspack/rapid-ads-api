@@ -77,6 +77,10 @@ export default {
         return await handlePaymentHistory(request, env);
       }
 
+      if (path === "/payment-status" && request.method === "POST") {
+  return await handlePaymentStatus(request, env);
+      }
+
       if (path === "/faucetpay-config-check" && request.method === "POST") {
         return await handleFaucetPayConfigCheck(request, env);
       }
@@ -1093,6 +1097,64 @@ async function handlePaymentHistory(request, env) {
     }, 400);
   }
 }
+async function handlePaymentStatus(request, env) {
+  try {
+    const { body, user } = await authenticateRequest(request, env);
+
+    const ymid = String(body.ymid || "").trim();
+
+    if (!ymid || ymid.length > 200) {
+      return jsonResponse({
+        ok: false,
+        error: "Invalid ad session ID."
+      }, 400);
+    }
+
+    const db = getDatabase(env);
+
+    const payment = await db.prepare(`
+      SELECT
+        ms.ymid,
+        ms.status AS session_status,
+        p.amount_units,
+        p.currency,
+        p.status AS payment_status,
+        p.faucetpay_reference
+      FROM monetag_sessions ms
+      LEFT JOIN payments p
+        ON p.session_id = ms.id
+      WHERE ms.ymid = ?
+        AND ms.telegram_id = ?
+      LIMIT 1
+    `).bind(ymid, user.id).first();
+
+    if (!payment) {
+      return jsonResponse({
+        ok: true,
+        status: "NOT_FOUND",
+        message: "Ad session not found."
+      });
+    }
+
+    const status = payment.payment_status || "WAITING";
+
+    return jsonResponse({
+      ok: true,
+      status,
+      amount_units: payment.amount_units || null,
+      currency: payment.currency || null,
+      faucetpay_reference: payment.faucetpay_reference || null
+    });
+
+  } catch (error) {
+    console.error("Payment status error:", error);
+
+    return jsonResponse({
+      ok: false,
+      error: "Unable to check payment status."
+    }, 400);
+  }
+      }
 async function sendFaucetPayPayment(db, env, session) {
   // Development safety: do not create payment records or send payments.
   if (!CONFIG.PAYOUTS_ENABLED) {
