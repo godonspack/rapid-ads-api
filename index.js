@@ -77,6 +77,9 @@ export default {
         return await handlePaymentHistory(request, env);
       }
 
+      if (path === "/faucetpay-config-check" && request.method === "POST") {
+  return await handleFaucetPayConfigCheck(request, env);
+     }
       return jsonResponse({
         ok: false,
         error: "Route not found."
@@ -92,7 +95,29 @@ export default {
     }
   }
 };
+async function handleFaucetPayConfigCheck(request, env) {
+  try {
+    // Require an authenticated Telegram user.
+    await authenticateRequest(request, env);
 
+    return jsonResponse({
+      ok: true,
+      faucetpay_api_key_configured: Boolean(
+        env.FAUCETPAY_API_KEY &&
+        String(env.FAUCETPAY_API_KEY).trim()
+      ),
+      payouts_enabled: CONFIG.PAYOUTS_ENABLED
+    });
+
+  } catch (error) {
+    console.error("FaucetPay config check error:", error);
+
+    return jsonResponse({
+      ok: false,
+      error: "Configuration check failed."
+    }, 401);
+  }
+      }
 // ============================================================
 // RESPONSE HELPERS
 // ============================================================
