@@ -1018,38 +1018,49 @@ const now = unixTime();
       });
     }
 
-    // A failed or uncertain payment attempt is final.
-    if (paymentResult.status !== "FAILED") {
-      console.error(
-        "Unexpected FaucetPay payment status:",
-        paymentResult.status
-      );
-
+        // An uncertain payment must remain unresolved.
+    // Never retry or allow another session to bypass it.
+    if (paymentResult.status === "UNKNOWN") {
       return jsonResponse({
-        ok: false,
+        ok: true,
         verified: true,
         payout_status: "UNKNOWN",
-        error: "Unexpected payment status. No retry was attempted."
-      }, 500);
+        message: "Payment outcome is uncertain. Reconciliation is required. No retry was attempted."
+      }, 202);
     }
 
-    await db.prepare(`
-      UPDATE monetag_sessions
-      SET status = 'FAILED',
-          verified_at = ?
-      WHERE id = ?
-        AND status = 'PENDING'
-    `).bind(
-      now,
-      session.id
-    ).run();
+    // A definitively failed payment attempt is final.
+    if (paymentResult.status === "FAILED") {
+      await db.prepare(`
+        UPDATE monetag_sessions
+        SET status = 'FAILED',
+            verified_at = ?
+        WHERE id = ?
+          AND status = 'PENDING'
+      `).bind(
+        now,
+        session.id
+      ).run();
+
+      return jsonResponse({
+        ok: true,
+        verified: true,
+        payout_status: "FAILED",
+        message: "Payment failed. No retry will be attempted."
+      });
+    }
+
+    console.error(
+      "Unexpected FaucetPay payment status:",
+      paymentResult.status
+    );
 
     return jsonResponse({
-      ok: true,
+      ok: false,
       verified: true,
-      payout_status: "FAILED",
-      message: "Payment failed or its outcome is uncertain. No retry will be attempted."
-    });
+      payout_status: "UNKNOWN",
+      error: "Unexpected payment status. No retry was attempted."
+    }, 500);
     } catch (error) {
     console.error("Monetag postback error:", error);
 
