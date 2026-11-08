@@ -19,7 +19,7 @@ REWARD_UNITS_PER_USDT: 100000000,
   TELEGRAM_AUTH_MAX_AGE: 86400,
 
   // Payouts are deliberately disabled.
-  PAYOUTS_ENABLED: true 
+  PAYOUTS_ENABLED: false 
 };
 
 // ============================================================
