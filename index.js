@@ -1308,10 +1308,36 @@ async function sendFaucetPayPayment(db, env, session) {
       };
     }
 
-    // FaucetPay did not confirm the payment.
+    // FaucetPay did not provide a confirmed successful payment.
+// Treat the outcome as UNKNOWN until it can be reconciled.
+await db.prepare(`
+  UPDATE payments
+  SET status = 'UNKNOWN',
+      updated_at = ?
+  WHERE id = ?
+    AND session_id = ?
+    AND status = 'PROCESSING'
+`).bind(
+  unixTime(),
+  paymentId,
+  session.id
+).run();
+
+return {
+  ok: false,
+  status: "UNKNOWN",
+  error: "Payment outcome requires reconciliation."
+};
+
+  } catch (error) {
+  console.error("FaucetPay payment error:", error);
+
+  // The request may have reached FaucetPay.
+  // Never retry an uncertain payment.
+  try {
     await db.prepare(`
       UPDATE payments
-      SET status = 'FAILED',
+      SET status = 'UNKNOWN',
           updated_at = ?
       WHERE id = ?
         AND session_id = ?
@@ -1322,43 +1348,18 @@ async function sendFaucetPayPayment(db, env, session) {
       session.id
     ).run();
 
-    return {
-      ok: false,
-      status: "FAILED",
-      error: "FaucetPay did not confirm the payment."
-    };
+  } catch (databaseError) {
+    console.error(
+      "Could not record uncertain FaucetPay payment:",
+      databaseError
+    );
+  }
 
-  } catch (error) {
-    console.error("FaucetPay payment error:", error);
-
-    // Best-effort failure recording.
-    // Never send another payment request for this session.
-    try {
-      await db.prepare(`
-        UPDATE payments
-        SET status = 'FAILED',
-            updated_at = ?
-        WHERE id = ?
-          AND session_id = ?
-          AND status = 'PROCESSING'
-      `).bind(
-        unixTime(),
-        paymentId,
-        session.id
-      ).run();
-
-    } catch (databaseError) {
-      console.error(
-        "Could not record FaucetPay failure:",
-        databaseError
-      );
-    }
-
-    return {
-      ok: false,
-      status: "FAILED",
-      error: "Payment failed or its outcome is uncertain."
-    };
+  return {
+    ok: false,
+    status: "UNKNOWN",
+    error: "Payment outcome is uncertain. Reconciliation is required."
+  };
   }
       }
 // ==========================================
