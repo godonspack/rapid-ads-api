@@ -766,7 +766,23 @@ async function handleMonetagRegister(request, env) {
     }
 
     const now = unixTime();
+    
+    // Block new sessions while an earlier payment is unresolved.
+    const unresolvedPayment = await db.prepare(`
+      SELECT p.id
+      FROM payments p
+      INNER JOIN monetag_sessions ms
+        ON ms.id = p.session_id
+      WHERE ms.telegram_id = ?
+        AND p.status IN ('PROCESSING', 'UNKNOWN')
+      LIMIT 1
+    `).bind(user.id).first();
 
+    if (unresolvedPayment) {
+      throw new Error(
+        "You have an unresolved payment. Please wait for reconciliation before starting another ad session."
+      );
+    }
     const reservation = await db.prepare(`
   SELECT reservation_token
   FROM monetag_reservations
