@@ -783,7 +783,11 @@ async function handleMonetagRegister(request, env) {
     }
 
     const now = unixTime();
-    
+    const dailyCount = await getMonetagDailyCount(db, user.id);
+
+if (dailyCount >= CONFIG.MONETAG_DAILY_LIMIT) {
+  throw new Error("Daily Monetag limit reached.");
+}
     // Block new sessions while an earlier payment is unresolved.
     const unresolvedPayment = await db.prepare(`
       SELECT p.id
