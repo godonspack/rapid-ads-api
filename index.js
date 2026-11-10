@@ -1,25 +1,32 @@
 // ============================================================
-// RAPID ADS API
-// Fresh Cloudflare Worker
+// RAPID ADS API — CLOUDFLARE WORKER
+// Monetag Rewarded Interstitial + Rewarded Popup
 // ============================================================
 
 const CONFIG = {
   APP_NAME: "Rapid Ads",
 
   MONETAG_ZONE_ID: "12109194",
+
+  // Rewarded Interstitial
   MONETAG_REWARD_UNITS: 50000,
-MONETAG_REWARD_CURRENCY: "USDT",
-REWARD_UNITS_PER_USDT: 100000000,
-  MONETAG_COOLDOWN_SECONDS: 60,
   MONETAG_DAILY_LIMIT: 100,
+  MONETAG_COOLDOWN_SECONDS: 60,
   MONETAG_RESERVATION_SECONDS: 120,
 
-  FAUCETPAY_API_BASE: "https://faucetpay.io/api/v2",
+  // Rewarded Popup
+  MONETAG_POPUP_REWARD_UNITS: 20000,
+  MONETAG_POPUP_DAILY_LIMIT: 50,
+  MONETAG_POPUP_PREFIX: "rapop_",
 
+  MONETAG_REWARD_CURRENCY: "USDT",
+  REWARD_UNITS_PER_USDT: 100000000,
+
+  FAUCETPAY_API_BASE: "https://faucetpay.io/api/v2",
   TELEGRAM_AUTH_MAX_AGE: 86400,
 
-  // Payouts are deliberately disabled.
-  PAYOUTS_ENABLED: true 
+  // Preserved from your existing configuration.
+  PAYOUTS_ENABLED: true
 };
 
 // ============================================================
@@ -56,7 +63,7 @@ export default {
           message: "Rapid Ads API is running."
         });
       }
-      
+
       if (path === "/faucetpay-email" && request.method === "POST") {
         return await handleFaucetPayEmail(request, env);
       }
@@ -69,6 +76,10 @@ export default {
         return await handleMonetagRegister(request, env);
       }
 
+      if (path === "/monetag-popup-prepare" && request.method === "POST") {
+        return await handleMonetagPopupPrepare(request, env);
+      }
+
       if (path === "/monetag-postback" && request.method === "GET") {
         return await handleMonetagPostback(request, env);
       }
@@ -78,7 +89,7 @@ export default {
       }
 
       if (path === "/payment-status" && request.method === "POST") {
-  return await handlePaymentStatus(request, env);
+        return await handlePaymentStatus(request, env);
       }
 
       return jsonResponse({
@@ -96,29 +107,7 @@ export default {
     }
   }
 };
-async function handleFaucetPayConfigCheck(request, env) {
-  try {
-    // Require an authenticated Telegram user.
-    await authenticateRequest(request, env);
 
-    return jsonResponse({
-      ok: true,
-      faucetpay_api_key_configured: Boolean(
-        env.FAUCETPAY_API_KEY &&
-        String(env.FAUCETPAY_API_KEY).trim()
-      ),
-      payouts_enabled: CONFIG.PAYOUTS_ENABLED
-    });
-
-  } catch (error) {
-    console.error("FaucetPay config check error:", error);
-
-    return jsonResponse({
-      ok: false,
-      error: "Configuration check failed."
-    }, 401);
-  }
-      }
 // ============================================================
 // RESPONSE HELPERS
 // ============================================================
@@ -149,6 +138,10 @@ async function readJson(request) {
 
 function unixTime() {
   return Math.floor(Date.now() / 1000);
+}
+
+function utcDayStart() {
+  return Math.floor(unixTime() / 86400) * 86400;
 }
 
 function utcDateKey() {
@@ -316,6 +309,7 @@ async function registerFaucetPayEmail(db, user, email) {
   }
 
   const normalizedEmail = email.trim().toLowerCase();
+  const now = unixTime();
 
   await db.prepare(`
     INSERT INTO users (
@@ -332,8 +326,8 @@ async function registerFaucetPayEmail(db, user, email) {
   `).bind(
     user.id,
     normalizedEmail,
-    unixTime(),
-    unixTime()
+    now,
+    now
   ).run();
 
   return {
@@ -347,6 +341,18 @@ async function getRegisteredUser(db, telegramId) {
     SELECT telegram_id, faucetpay_email, created_at
     FROM users
     WHERE telegram_id = ?
+  `).bind(telegramId).first();
+}
+
+async function hasUnresolvedPayment(db, telegramId) {
+  return await db.prepare(`
+    SELECT p.id
+    FROM payments p
+    INNER JOIN monetag_sessions ms
+      ON ms.id = p.session_id
+    WHERE ms.telegram_id = ?
+      AND p.status IN ('PROCESSING', 'UNKNOWN')
+    LIMIT 1
   `).bind(telegramId).first();
 }
 
@@ -379,7 +385,7 @@ async function handleFaucetPayEmail(request, env) {
 }
 
 // ============================================================
-// MONETAG DAILY LIMIT AND COOLDOWN
+// MONETAG DAILY COUNTS
 // ============================================================
 
 async function getMonetagDailyCount(db, telegramId) {
@@ -387,7 +393,8 @@ async function getMonetagDailyCount(db, telegramId) {
     SELECT COUNT(*) AS total
     FROM monetag_sessions
     WHERE telegram_id = ?
-    AND date(created_at, 'unixepoch') = ?
+      AND date(created_at, 'unixepoch') = ?
+      AND ymid NOT LIKE 'rapop_%'
   `).bind(
     telegramId,
     utcDateKey()
@@ -395,6 +402,25 @@ async function getMonetagDailyCount(db, telegramId) {
 
   return Number(daily?.total || 0);
 }
+
+async function getPopupDailyCount(db, telegramId) {
+  const daily = await db.prepare(`
+    SELECT COUNT(*) AS total
+    FROM monetag_sessions
+    WHERE telegram_id = ?
+      AND date(created_at, 'unixepoch') = ?
+      AND ymid LIKE 'rapop_%'
+  `).bind(
+    telegramId,
+    utcDateKey()
+  ).first();
+
+  return Number(daily?.total || 0);
+}
+
+// ============================================================
+// MONETAG COOLDOWN
+// ============================================================
 
 async function getMonetagCooldown(db, telegramId) {
   const latest = await db.prepare(`
@@ -410,9 +436,10 @@ async function getMonetagCooldown(db, telegramId) {
   return Math.max(
     0,
     CONFIG.MONETAG_COOLDOWN_SECONDS -
-    (unixTime() - Number(latest.finished_at))
+      (unixTime() - Number(latest.finished_at))
   );
 }
+
 async function ensureMonetagCooldown(db, session) {
   const now = unixTime();
 
@@ -442,8 +469,9 @@ async function ensureMonetagCooldown(db, session) {
     now
   ).run();
 }
+
 // ============================================================
-// MONETAG COOLDOWN ACTIONS
+// MONETAG INTERSTITIAL COOLDOWN ACTIONS
 // ============================================================
 
 async function handleMonetagCooldown(request, env) {
@@ -454,142 +482,117 @@ async function handleMonetagCooldown(request, env) {
     const action = String(body.action || "check_cooldown");
     const now = unixTime();
 
-    // --------------------------------------------------------
-    // CANCEL RESERVATION
-    // --------------------------------------------------------
-
     if (action === "cancel_watch") {
-  const token = String(body.reservation_token || "");
+      const token = String(body.reservation_token || "");
 
-  if (!token) {
-    throw new Error("Reservation token is required.");
-  }
+      if (!token) {
+        throw new Error("Reservation token is required.");
+      }
 
-  const result = await db.prepare(`
-    DELETE FROM monetag_reservations
-    WHERE telegram_id = ?
-      AND reservation_token = ?
-      AND NOT EXISTS (
-        SELECT 1
-        FROM monetag_sessions
-        WHERE monetag_sessions.telegram_id = ?
-          AND monetag_sessions.reservation_token = ?
-      )
-  `).bind(user.id, token, user.id, token).run();
+      const result = await db.prepare(`
+        DELETE FROM monetag_reservations
+        WHERE telegram_id = ?
+          AND reservation_token = ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM monetag_sessions
+            WHERE monetag_sessions.telegram_id = ?
+              AND monetag_sessions.reservation_token = ?
+          )
+      `).bind(user.id, token, user.id, token).run();
 
-  return jsonResponse({
-    ok: true,
-    cancelled: Number(result.meta?.changes || 0) > 0
-  });
+      return jsonResponse({
+        ok: true,
+        cancelled: Number(result.meta?.changes || 0) > 0
+      });
     }
 
-    // --------------------------------------------------------
-    // FINISH WATCH
-    // --------------------------------------------------------
-
     if (action === "finish_watch") {
-  const token = String(body.reservation_token || "");
-  const ymid = String(body.ymid || "");
+      const token = String(body.reservation_token || "");
+      const ymid = String(body.ymid || "");
 
-  if (!token || !ymid) {
-    throw new Error("Reservation token and session ID are required.");
-  }
+      if (!token || !ymid) {
+        throw new Error("Reservation token and session ID are required.");
+      }
 
-  const session = await db.prepare(`
-    SELECT
-      id,
-      status,
-      reservation_token
-    FROM monetag_sessions
-    WHERE telegram_id = ?
-      AND ymid = ?
-  `).bind(user.id, ymid).first();
+      const session = await db.prepare(`
+        SELECT id, status, reservation_token
+        FROM monetag_sessions
+        WHERE telegram_id = ?
+          AND ymid = ?
+          AND ymid NOT LIKE 'rapop_%'
+      `).bind(user.id, ymid).first();
 
-  if (!session) {
-    throw new Error("Monetag session not found.");
-  }
+      if (!session) {
+        throw new Error("Monetag session not found.");
+      }
 
-  if (session.reservation_token !== token) {
-    throw new Error("Reservation token does not match this session.");
-  }
+      if (session.reservation_token !== token) {
+        throw new Error("Reservation token does not match this session.");
+      }
 
-  // Atomically insert or update the cooldown.
-  // A session can never restart its own cooldown.
-  // An older session cannot overwrite a newer session.
-  await db.prepare(`
-    INSERT INTO monetag_cooldowns (
-      telegram_id,
-      session_id,
-      finished_at
-    )
-    VALUES (?, ?, ?)
-    ON CONFLICT(telegram_id)
-    DO UPDATE SET
-      session_id = excluded.session_id,
-      finished_at = excluded.finished_at
-    WHERE
-  monetag_cooldowns.session_id = excluded.session_id
-  OR (
-    SELECT rowid
-    FROM monetag_sessions
-    WHERE id = excluded.session_id
-  ) > (
-    SELECT rowid
-    FROM monetag_sessions
-    WHERE id = monetag_cooldowns.session_id
-  )
-  `).bind(
-    user.id,
-    session.id,
-    now
-  ).run();
+      await db.prepare(`
+        INSERT INTO monetag_cooldowns (
+          telegram_id,
+          session_id,
+          finished_at
+        )
+        VALUES (?, ?, ?)
+        ON CONFLICT(telegram_id)
+        DO UPDATE SET
+          session_id = excluded.session_id,
+          finished_at = excluded.finished_at
+        WHERE
+          monetag_cooldowns.session_id = excluded.session_id
+          OR (
+            SELECT rowid
+            FROM monetag_sessions
+            WHERE id = excluded.session_id
+          ) > (
+            SELECT rowid
+            FROM monetag_sessions
+            WHERE id = monetag_cooldowns.session_id
+          )
+      `).bind(user.id, session.id, now).run();
 
-  // Read the actual cooldown currently recorded for this user.
-  const cooldown = await db.prepare(`
-    SELECT
-      mc.session_id,
-      mc.finished_at
-    FROM monetag_cooldowns mc
-    WHERE mc.telegram_id = ?
-  `).bind(user.id).first();
+      const cooldown = await db.prepare(`
+        SELECT session_id, finished_at
+        FROM monetag_cooldowns
+        WHERE telegram_id = ?
+      `).bind(user.id).first();
 
-  if (!cooldown) {
-    throw new Error("Unable to record Monetag cooldown.");
-  }
+      if (!cooldown) {
+        throw new Error("Unable to record Monetag cooldown.");
+      }
 
-  // Remove this session's reservation.
-  await db.prepare(`
-    DELETE FROM monetag_reservations
-    WHERE telegram_id = ?
-      AND reservation_token = ?
-  `).bind(user.id, token).run();
+      await db.prepare(`
+        DELETE FROM monetag_reservations
+        WHERE telegram_id = ?
+          AND reservation_token = ?
+      `).bind(user.id, token).run();
 
-  const remaining = Math.max(
-    0,
-    CONFIG.MONETAG_COOLDOWN_SECONDS -
-    (now - Number(cooldown.finished_at))
-  );
+      const remaining = Math.max(
+        0,
+        CONFIG.MONETAG_COOLDOWN_SECONDS -
+          (now - Number(cooldown.finished_at))
+      );
 
-  return jsonResponse({
-    ok: true,
-    cooldown_started: true,
-    cooldown_seconds: CONFIG.MONETAG_COOLDOWN_SECONDS,
-    remaining_seconds: remaining,
-    attempt_recorded: true,
-    reward_credited: false,
-    reward_eligible_for_review:
-      cooldown.session_id === session.id &&
-      session.status === "VERIFIED"
-  });
+      return jsonResponse({
+        ok: true,
+        cooldown_started: true,
+        cooldown_seconds: CONFIG.MONETAG_COOLDOWN_SECONDS,
+        remaining_seconds: remaining,
+        attempt_recorded: true,
+        reward_credited: false,
+        reward_eligible_for_review:
+          cooldown.session_id === session.id &&
+          session.status === "VERIFIED"
+      });
     }
 
     if (action !== "check_cooldown" && action !== "reserve_watch") {
       throw new Error("Unsupported Monetag action.");
     }
-
-    // --------------------------------------------------------
-    // REQUIRE FAUCETPAY EMAIL REGISTRATION
-    // --------------------------------------------------------
 
     const registeredUser = await getRegisteredUser(db, user.id);
 
@@ -601,31 +604,17 @@ async function handleMonetagCooldown(request, env) {
         error: "Register your FaucetPay email before watching ads."
       }, 403);
     }
-    // Block reservations while an earlier payment is unresolved.
-    const unresolvedPayment = await db.prepare(`
-      SELECT p.id
-      FROM payments p
-      INNER JOIN monetag_sessions ms
-        ON ms.id = p.session_id
-      WHERE ms.telegram_id = ?
-        AND p.status IN ('PROCESSING', 'UNKNOWN')
-      LIMIT 1
-    `).bind(user.id).first();
 
-    if (unresolvedPayment) {
+    if (await hasUnresolvedPayment(db, user.id)) {
       return jsonResponse({
         ok: false,
         can_watch: false,
         error: "You have an unresolved payment. Please wait for reconciliation before starting another ad session."
       }, 409);
     }
-    // --------------------------------------------------------
-    // DAILY LIMIT AND COOLDOWN
-    // --------------------------------------------------------
 
     const remaining = await getMonetagCooldown(db, user.id);
     const dailyCount = await getMonetagDailyCount(db, user.id);
-
     const dailyRemaining = Math.max(
       0,
       CONFIG.MONETAG_DAILY_LIMIT - dailyCount
@@ -657,104 +646,94 @@ async function handleMonetagCooldown(request, env) {
       }, 429);
     }
 
-    // --------------------------------------------------------
-    // CREATE RESERVATION
-    // --------------------------------------------------------
-
     const existingReservation = await db.prepare(`
-  SELECT reservation_token, expires_at
-  FROM monetag_reservations
-  WHERE telegram_id = ?
-`).bind(user.id).first();
+      SELECT reservation_token, expires_at
+      FROM monetag_reservations
+      WHERE telegram_id = ?
+    `).bind(user.id).first();
 
-if (
-  existingReservation &&
-  Number(existingReservation.expires_at) >= now
-) {
-  const existingSession = await db.prepare(`
-    SELECT id
-    FROM monetag_sessions
-    WHERE telegram_id = ?
-      AND reservation_token = ?
-    LIMIT 1
-  `).bind(
-    user.id,
-    existingReservation.reservation_token
-  ).first();
+    if (
+      existingReservation &&
+      Number(existingReservation.expires_at) >= now
+    ) {
+      const existingSession = await db.prepare(`
+        SELECT id
+        FROM monetag_sessions
+        WHERE telegram_id = ?
+          AND reservation_token = ?
+        LIMIT 1
+      `).bind(user.id, existingReservation.reservation_token).first();
 
-  if (!existingSession) {
+      if (!existingSession) {
+        return jsonResponse({
+          ok: true,
+          can_watch: true,
+          reservation_token: existingReservation.reservation_token,
+          remaining_seconds: 0,
+          reservation_reused: true
+        });
+      }
+
+      return jsonResponse({
+        ok: false,
+        can_watch: false,
+        error: "An advertisement session is already registered. Please wait for it to finish."
+      }, 409);
+    }
+
+    await db.prepare(`
+      DELETE FROM monetag_reservations
+      WHERE telegram_id = ?
+        AND expires_at < ?
+    `).bind(user.id, now).run();
+
+    const token = randomId("reservation");
+
+    try {
+      await db.prepare(`
+        INSERT INTO monetag_reservations (
+          telegram_id,
+          reservation_token,
+          expires_at,
+          created_at
+        )
+        VALUES (?, ?, ?, ?)
+      `).bind(
+        user.id,
+        token,
+        now + CONFIG.MONETAG_RESERVATION_SECONDS,
+        now
+      ).run();
+
+    } catch (error) {
+      if (String(error.message || "").includes("constraint")) {
+        return jsonResponse({
+          ok: false,
+          can_watch: false,
+          error: "A watch reservation is already active."
+        }, 409);
+      }
+
+      throw error;
+    }
+
     return jsonResponse({
       ok: true,
       can_watch: true,
-      reservation_token: existingReservation.reservation_token,
-      remaining_seconds: 0,
-      reservation_reused: true,
-      message: "Your previous unused reservation has been recovered."
+      reservation_token: token,
+      remaining_seconds: 0
     });
-  }
 
-  return jsonResponse({
-    ok: false,
-    can_watch: false,
-    error: "An advertisement session is already registered. Please wait for it to finish."
-  }, 409);
-}
-
-await db.prepare(`
-  DELETE FROM monetag_reservations
-  WHERE telegram_id = ?
-    AND expires_at < ?
-`).bind(user.id, now).run();
-
-const token = randomId("reservation");
-
-try {
-  await db.prepare(`
-    INSERT INTO monetag_reservations (
-      telegram_id,
-      reservation_token,
-      expires_at,
-      created_at
-    )
-    VALUES (?, ?, ?, ?)
-  `).bind(
-    user.id,
-    token,
-    now + CONFIG.MONETAG_RESERVATION_SECONDS,
-    now
-  ).run();
-
-} catch (error) {
-  const message = String(error.message || "");
-
-  if (
-    message.includes("UNIQUE constraint failed") ||
-    message.includes("constraint failed")
-  ) {
-    return jsonResponse({
-      ok: false,
-      can_watch: false,
-      error: "A watch reservation is already active."
-    }, 409);
-  }
-
-  throw error;
-}
-return jsonResponse({
-  ok: true,
-  can_watch: true,
-  reservation_token: token,
-  remaining_seconds: 0
-});
-} catch (error) {
+  } catch (error) {
     return jsonResponse({
       ok: false,
       error: error.message
     }, 400);
   }
 }
+
 // ============================================================
-// MONETAG SESSION REGISTRATION
+// MONETAG REWARDED INTERSTITIAL REGISTRATION
 // ============================================================
 
 async function handleMonetagRegister(request, env) {
@@ -765,7 +744,10 @@ async function handleMonetagRegister(request, env) {
     const ymid = String(body.ymid || "");
     const reservationToken = String(body.reservation_token || "");
 
-    if (!/^[a-zA-Z0-9_-]{1,150}$/.test(ymid)) {
+    if (
+      !/^[a-zA-Z0-9_-]{1,150}$/.test(ymid) ||
+      ymid.startsWith(CONFIG.MONETAG_POPUP_PREFIX)
+    ) {
       throw new Error("Invalid Monetag session ID.");
     }
 
@@ -779,41 +761,16 @@ async function handleMonetagRegister(request, env) {
       throw new Error("Register your FaucetPay email first.");
     }
 
+    if (await hasUnresolvedPayment(db, user.id)) {
+      throw new Error("You have an unresolved payment. Please wait for reconciliation.");
+    }
+
     const now = unixTime();
-    const dailyCount = await getMonetagDailyCount(db, user.id);
-
-    if (dailyCount >= CONFIG.MONETAG_DAILY_LIMIT) {
-      throw new Error("Daily Monetag limit reached.");
-    }
-
-    // Block registration while a payment is unresolved.
-    const unresolvedPayment = await db.prepare(`
-      SELECT p.id
-      FROM payments p
-      INNER JOIN monetag_sessions ms
-        ON ms.id = p.session_id
-      WHERE ms.telegram_id = ?
-        AND p.status IN ('PROCESSING', 'UNKNOWN')
-      LIMIT 1
-    `).bind(user.id).first();
-
-    if (unresolvedPayment) {
-      throw new Error(
-        "You have an unresolved payment. Please wait for reconciliation before starting another ad session."
-      );
-    }
-
     const id = randomId("monetag");
-
-    // --------------------------------------------------------
-    // ATOMIC SESSION INSERT AND RESERVATION CONSUMPTION
-    // --------------------------------------------------------
-    // D1 batch executes these statements transactionally.
-    // The reservation is consumed only if this exact session
-    // was successfully inserted.
+    const dayStart = utcDayStart();
+    const dayEnd = dayStart + 86400;
 
     const results = await db.batch([
-
       db.prepare(`
         INSERT INTO monetag_sessions (
           id,
@@ -842,8 +799,7 @@ async function handleMonetagRegister(request, env) {
         AND NOT EXISTS (
           SELECT 1
           FROM payments p
-          INNER JOIN monetag_sessions ms
-            ON ms.id = p.session_id
+          INNER JOIN monetag_sessions ms ON ms.id = p.session_id
           WHERE ms.telegram_id = ?
             AND p.status IN ('PROCESSING', 'UNKNOWN')
         )
@@ -851,6 +807,7 @@ async function handleMonetagRegister(request, env) {
           SELECT COUNT(*)
           FROM monetag_sessions
           WHERE telegram_id = ?
+            AND ymid NOT LIKE 'rapop_%'
             AND created_at >= ?
             AND created_at < ?
         ) < ?
@@ -868,12 +825,11 @@ async function handleMonetagRegister(request, env) {
         ymid,
         user.id,
         user.id,
-        Math.floor(now / 86400) * 86400,
-        (Math.floor(now / 86400) + 1) * 86400,
+        dayStart,
+        dayEnd,
         CONFIG.MONETAG_DAILY_LIMIT
       ),
 
-      // Delete only the reservation consumed by this insertion.
       db.prepare(`
         DELETE FROM monetag_reservations
         WHERE telegram_id = ?
@@ -894,12 +850,9 @@ async function handleMonetagRegister(request, env) {
         ymid,
         reservationToken
       )
-
     ]);
 
-    const inserted = Number(results[0]?.meta?.changes || 0);
-
-    if (inserted !== 1) {
+    if (Number(results[0]?.meta?.changes || 0) !== 1) {
       throw new Error(
         "Registration failed. Your reservation may have expired, already been used, or your daily limit may have been reached."
       );
@@ -921,6 +874,162 @@ async function handleMonetagRegister(request, env) {
 }
 
 // ============================================================
+// MONETAG REWARDED POPUP PREPARATION
+// ============================================================
+
+async function handleMonetagPopupPrepare(request, env) {
+  try {
+    const { user } = await authenticateRequest(request, env);
+    const db = getDatabase(env);
+    const now = unixTime();
+
+    const registeredUser = await getRegisteredUser(db, user.id);
+
+    if (!registeredUser?.faucetpay_email) {
+      return jsonResponse({
+        ok: false,
+        registered: false,
+        error: "Register your FaucetPay email before opening ads."
+      }, 403);
+    }
+
+    if (await hasUnresolvedPayment(db, user.id)) {
+      return jsonResponse({
+        ok: false,
+        error: "You have an unresolved payment. Please wait for reconciliation."
+      }, 409);
+    }
+
+    // Reuse a recent pending popup session rather than creating
+    // multiple sessions when the frontend requests preparation again.
+    const existing = await db.prepare(`
+      SELECT ymid, created_at
+      FROM monetag_sessions
+      WHERE telegram_id = ?
+        AND ymid LIKE 'rapop_%'
+        AND status = 'PENDING'
+        AND created_at >= ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).bind(user.id, now - 900).first();
+
+    const dailyCount = await getPopupDailyCount(db, user.id);
+    const dailyRemaining = Math.max(
+      0,
+      CONFIG.MONETAG_POPUP_DAILY_LIMIT - dailyCount
+    );
+
+    if (existing) {
+      return jsonResponse({
+        ok: true,
+        prepared: true,
+        reused: true,
+        ymid: existing.ymid,
+        daily_count: dailyCount,
+        daily_remaining: dailyRemaining
+      });
+    }
+
+    if (dailyRemaining <= 0) {
+      return jsonResponse({
+        ok: false,
+        limit_reached: true,
+        daily_count: dailyCount,
+        daily_remaining: 0,
+        error: "Daily Rewarded Popup limit reached."
+      }, 429);
+    }
+
+    const ymid = CONFIG.MONETAG_POPUP_PREFIX + crypto.randomUUID();
+    const id = randomId("popup");
+    const dayStart = utcDayStart();
+    const dayEnd = dayStart + 86400;
+
+    // The insert itself enforces the daily cap and unresolved-payment
+    // restriction, including concurrent preparation requests.
+    const inserted = await db.prepare(`
+      INSERT INTO monetag_sessions (
+        id,
+        telegram_id,
+        ymid,
+        status,
+        reward_units,
+        created_at,
+        reservation_token,
+        faucetpay_email
+      )
+      SELECT
+        ?, ?, ?, 'PENDING', ?, ?, NULL, ?
+      WHERE
+        (
+          SELECT COUNT(*)
+          FROM monetag_sessions
+          WHERE telegram_id = ?
+            AND ymid LIKE 'rapop_%'
+            AND created_at >= ?
+            AND created_at < ?
+        ) < ?
+        AND NOT EXISTS (
+          SELECT 1
+          FROM payments p
+          INNER JOIN monetag_sessions ms ON ms.id = p.session_id
+          WHERE ms.telegram_id = ?
+            AND p.status IN ('PROCESSING', 'UNKNOWN')
+        )
+    `).bind(
+      id,
+      user.id,
+      ymid,
+      CONFIG.MONETAG_POPUP_REWARD_UNITS,
+      now,
+      registeredUser.faucetpay_email,
+      user.id,
+      dayStart,
+      dayEnd,
+      CONFIG.MONETAG_POPUP_DAILY_LIMIT,
+      user.id
+    ).run();
+
+    if (Number(inserted.meta?.changes || 0) !== 1) {
+      const latestCount = await getPopupDailyCount(db, user.id);
+
+      return jsonResponse({
+        ok: false,
+        limit_reached: latestCount >= CONFIG.MONETAG_POPUP_DAILY_LIMIT,
+        daily_count: latestCount,
+        daily_remaining: Math.max(
+          0,
+          CONFIG.MONETAG_POPUP_DAILY_LIMIT - latestCount
+        ),
+        error: "Unable to prepare a Popup session. Please try again."
+      }, 409);
+    }
+
+    const updatedCount = await getPopupDailyCount(db, user.id);
+
+    return jsonResponse({
+      ok: true,
+      prepared: true,
+      reused: false,
+      ymid,
+      daily_count: updatedCount,
+      daily_remaining: Math.max(
+        0,
+        CONFIG.MONETAG_POPUP_DAILY_LIMIT - updatedCount
+      )
+    });
+
+  } catch (error) {
+    console.error("Popup preparation error:", error);
+
+    return jsonResponse({
+      ok: false,
+      error: error.message || "Unable to prepare Popup session."
+    }, 400);
+  }
+}
+
+// ============================================================
 // MONETAG POSTBACK
 // ============================================================
 
@@ -930,17 +1039,10 @@ async function handleMonetagPostback(request, env) {
       throw new Error("Monetag postback secret is not configured.");
     }
 
-    const url = new URL(request.url);
-    const params = url.searchParams;
-
-    // --------------------------------------------------------
-    // 1. VERIFY POSTBACK SECRET
-    // --------------------------------------------------------
-
-    const suppliedSecret = params.get("secret") || "";
+    const params = new URL(request.url).searchParams;
 
     if (!timingSafeEqual(
-      suppliedSecret,
+      params.get("secret") || "",
       env.MONETAG_POSTBACK_SECRET
     )) {
       return jsonResponse({
@@ -949,39 +1051,38 @@ async function handleMonetagPostback(request, env) {
       }, 401);
     }
 
-    // --------------------------------------------------------
-    // 2. READ MONETAG POSTBACK PARAMETERS
-    // --------------------------------------------------------
-
     const ymid = params.get("ymid") || "";
     const zone = params.get("zone_id") || "";
     const event = params.get("event_type") || "";
     const rewardType = params.get("reward_event_type") || "";
     const requestVar = params.get("request_var") || "";
 
-    // --------------------------------------------------------
-    // 3. REJECT NON-REWARDED AD PLACEMENTS
-    // --------------------------------------------------------
-    // Rewarded Watch Ads sessions use:
-    // requestVar: "rapid_ads_watch"
-    //
-    // In-App Interstitial interface ads use:
-    // request_var: "auto"
-    //
-    // Interface ads must never trigger user payouts.
+    // Passive In-App Interstitials never pay rewards.
+    if (requestVar === "auto") {
+      return jsonResponse({
+        ok: true,
+        ignored: true,
+        payout_status: "NOT_REWARD_ELIGIBLE"
+      });
+    }
 
-    if (requestVar !== "rapid_ads_watch") {
+    let placement;
+    let expectedRewardUnits;
+
+    if (requestVar === "rapid_ads_watch") {
+      placement = "interstitial";
+      expectedRewardUnits = CONFIG.MONETAG_REWARD_UNITS;
+    } else if (requestVar === "12109194_rapid_ads_popup") {
+      placement = "popup";
+      expectedRewardUnits = CONFIG.MONETAG_POPUP_REWARD_UNITS;
+    } else {
       return jsonResponse({
         ok: true,
         ignored: true,
         payout_status: "NOT_REWARD_ELIGIBLE",
-        message: "This Monetag placement is not eligible for a user reward."
+        message: "Unrecognised Monetag placement."
       });
     }
-
-    // --------------------------------------------------------
-    // 4. VALIDATE REWARDED EVENT
-    // --------------------------------------------------------
 
     if (
       !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid) ||
@@ -1004,9 +1105,25 @@ async function handleMonetagPostback(request, env) {
       });
     }
 
-    // --------------------------------------------------------
-    // 5. FIND THE REGISTERED SESSION
-    // --------------------------------------------------------
+    if (
+      placement === "popup" &&
+      !ymid.startsWith(CONFIG.MONETAG_POPUP_PREFIX)
+    ) {
+      return jsonResponse({
+        ok: false,
+        error: "Popup session ID does not match placement."
+      }, 400);
+    }
+
+    if (
+      placement === "interstitial" &&
+      ymid.startsWith(CONFIG.MONETAG_POPUP_PREFIX)
+    ) {
+      return jsonResponse({
+        ok: false,
+        error: "Interstitial session ID does not match placement."
+      }, 400);
+    }
 
     const db = getDatabase(env);
 
@@ -1016,7 +1133,8 @@ async function handleMonetagPostback(request, env) {
         telegram_id,
         status,
         reward_units,
-        faucetpay_email
+        faucetpay_email,
+        ymid
       FROM monetag_sessions
       WHERE ymid = ?
     `).bind(ymid).first();
@@ -1027,10 +1145,6 @@ async function handleMonetagPostback(request, env) {
         error: "Monetag session not found."
       }, 404);
     }
-
-    // --------------------------------------------------------
-    // 6. TEMPORARY LIVE-PAYMENT TEST RESTRICTION
-    // --------------------------------------------------------
 
     if (CONFIG.PAYOUTS_ENABLED) {
       const allowedTelegramId = String(
@@ -1050,29 +1164,22 @@ async function handleMonetagPostback(request, env) {
       }
     }
 
-    // --------------------------------------------------------
-    // 7. VALIDATE REWARD AMOUNT
-    // --------------------------------------------------------
-
     const rewardUnits = Number(session.reward_units);
 
     if (
       !Number.isSafeInteger(rewardUnits) ||
-      rewardUnits !== CONFIG.MONETAG_REWARD_UNITS
+      rewardUnits !== expectedRewardUnits
     ) {
-      throw new Error("Invalid reward amount.");
+      throw new Error("Invalid reward amount for this placement.");
     }
 
-    // --------------------------------------------------------
-    // 8. ENSURE COOLDOWN EXISTS
-    // --------------------------------------------------------
+    // Popup rewards do not create an Interstitial cooldown.
+    if (placement === "interstitial") {
+      await ensureMonetagCooldown(db, session);
+    }
 
-    await ensureMonetagCooldown(db, session);
-
-    // --------------------------------------------------------
-    // 9. PREVENT DUPLICATE SESSION PROCESSING
-    // --------------------------------------------------------
-
+    // A valued impression and valued click can both arrive for the
+    // same Popup ymid. Only the first event may initiate payment.
     if (session.status !== "PENDING") {
       return jsonResponse({
         ok: true,
@@ -1083,12 +1190,8 @@ async function handleMonetagPostback(request, env) {
 
     const now = unixTime();
 
-    // --------------------------------------------------------
-    // 10. HANDLE DISABLED PAYOUTS
-    // --------------------------------------------------------
-
     if (!CONFIG.PAYOUTS_ENABLED) {
-      await db.prepare(`
+      const update = await db.prepare(`
         UPDATE monetag_sessions
         SET status = 'VERIFIED',
             verified_at = ?
@@ -1098,25 +1201,16 @@ async function handleMonetagPostback(request, env) {
 
       return jsonResponse({
         ok: true,
-        verified: true,
-        payout_status: "DISABLED",
-        message: "Reward verified. Payouts are disabled."
+        verified: Number(update.meta?.changes || 0) === 1,
+        payout_status: "DISABLED"
       });
     }
-
-    // --------------------------------------------------------
-    // 11. MAKE THE ONE ALLOWED PAYOUT ATTEMPT
-    // --------------------------------------------------------
 
     const paymentResult = await sendFaucetPayPayment(
       db,
       env,
       session
     );
-
-    // --------------------------------------------------------
-    // 12. EXISTING PAYMENT OR DUPLICATE ATTEMPT
-    // --------------------------------------------------------
 
     if (
       paymentResult.status === "PROCESSING" ||
@@ -1130,10 +1224,6 @@ async function handleMonetagPostback(request, env) {
       });
     }
 
-    // --------------------------------------------------------
-    // 13. CONFIRMED PAYMENT
-    // --------------------------------------------------------
-
     if (paymentResult.status === "PAID") {
       await db.prepare(`
         UPDATE monetag_sessions
@@ -1142,39 +1232,15 @@ async function handleMonetagPostback(request, env) {
             paid_at = ?
         WHERE id = ?
           AND status = 'PENDING'
-      `).bind(
-        now,
-        now,
-        session.id
-      ).run();
+      `).bind(now, now, session.id).run();
 
       return jsonResponse({
         ok: true,
         verified: true,
-        duplicate: false,
         payout_status: "PAID",
         payout_id: paymentResult.payout_id || null
       });
     }
-
-    // --------------------------------------------------------
-    // 14. DISABLED PAYMENT RESULT
-    // --------------------------------------------------------
-
-    if (paymentResult.status === "DISABLED") {
-      return jsonResponse({
-        ok: true,
-        verified: true,
-        payout_status: "DISABLED",
-        message: "Reward verified. Payouts are disabled."
-      });
-    }
-
-    // --------------------------------------------------------
-    // 15. UNKNOWN PAYMENT RESULT
-    // --------------------------------------------------------
-    // Never retry an uncertain payment.
-    // The original payment must be reconciled.
 
     if (paymentResult.status === "UNKNOWN") {
       return jsonResponse({
@@ -1185,12 +1251,6 @@ async function handleMonetagPostback(request, env) {
       }, 202);
     }
 
-    // --------------------------------------------------------
-    // 16. DEFINITIVELY FAILED PAYMENT
-    // --------------------------------------------------------
-    // A failed attempt is final for this session.
-    // A new session is required for another attempt.
-
     if (paymentResult.status === "FAILED") {
       await db.prepare(`
         UPDATE monetag_sessions
@@ -1198,10 +1258,7 @@ async function handleMonetagPostback(request, env) {
             verified_at = ?
         WHERE id = ?
           AND status = 'PENDING'
-      `).bind(
-        now,
-        session.id
-      ).run();
+      `).bind(now, session.id).run();
 
       return jsonResponse({
         ok: true,
@@ -1210,15 +1267,6 @@ async function handleMonetagPostback(request, env) {
         message: "Payment failed. No retry will be attempted."
       });
     }
-
-    // --------------------------------------------------------
-    // 17. UNEXPECTED PAYMENT RESULT
-    // --------------------------------------------------------
-
-    console.error(
-      "Unexpected FaucetPay payment status:",
-      paymentResult.status
-    );
 
     return jsonResponse({
       ok: false,
@@ -1235,11 +1283,12 @@ async function handleMonetagPostback(request, env) {
       error: "Postback processing failed."
     }, 400);
   }
-          }
+}
 
 // ============================================================
 // PAYMENT HISTORY
 // ============================================================
+
 async function handlePaymentHistory(request, env) {
   try {
     const { user } = await authenticateRequest(request, env);
@@ -1274,10 +1323,14 @@ async function handlePaymentHistory(request, env) {
     }, 400);
   }
 }
+
+// ============================================================
+// PAYMENT STATUS
+// ============================================================
+
 async function handlePaymentStatus(request, env) {
   try {
     const { body, user } = await authenticateRequest(request, env);
-
     const ymid = String(body.ymid || "").trim();
 
     if (!ymid || ymid.length > 200) {
@@ -1313,11 +1366,9 @@ async function handlePaymentStatus(request, env) {
       });
     }
 
-    const status = payment.payment_status || "WAITING";
-
     return jsonResponse({
       ok: true,
-      status,
+      status: payment.payment_status || payment.session_status || "WAITING",
       amount_units: payment.amount_units || null,
       currency: payment.currency || null,
       faucetpay_reference: payment.faucetpay_reference || null
@@ -1331,9 +1382,13 @@ async function handlePaymentStatus(request, env) {
       error: "Unable to check payment status."
     }, 400);
   }
-      }
+}
+
+// ============================================================
+// FAUCETPAY PAYMENT
+// ============================================================
+
 async function sendFaucetPayPayment(db, env, session) {
-  // Development safety: do not create payment records or send payments.
   if (!CONFIG.PAYOUTS_ENABLED) {
     return {
       ok: false,
@@ -1345,7 +1400,15 @@ async function sendFaucetPayPayment(db, env, session) {
     .trim()
     .toLowerCase();
 
-  if (!email || !session?.id || !session?.telegram_id) {
+  const rewardUnits = Number(session?.reward_units);
+
+  if (
+    !email ||
+    !session?.id ||
+    !session?.telegram_id ||
+    !Number.isSafeInteger(rewardUnits) ||
+    rewardUnits <= 0
+  ) {
     return {
       ok: false,
       status: "FAILED",
@@ -1357,7 +1420,7 @@ async function sendFaucetPayPayment(db, env, session) {
   const paymentId = randomId("payment");
   const idempotencyKey = `rapid-ads-${session.id}`;
 
-  // Claim this session's one and only payment attempt.
+  // Claim the session's single permitted payment attempt.
   const inserted = await db.prepare(`
     INSERT INTO payments (
       id,
@@ -1377,7 +1440,7 @@ async function sendFaucetPayPayment(db, env, session) {
     paymentId,
     session.telegram_id,
     email,
-    CONFIG.MONETAG_REWARD_UNITS,
+    rewardUnits,
     CONFIG.MONETAG_REWARD_CURRENCY,
     idempotencyKey,
     session.id,
@@ -1385,7 +1448,6 @@ async function sendFaucetPayPayment(db, env, session) {
     now
   ).run();
 
-  // A payment record already exists: never send another payment.
   if (Number(inserted.meta?.changes || 0) !== 1) {
     const existing = await db.prepare(`
       SELECT status, faucetpay_reference
@@ -1401,7 +1463,6 @@ async function sendFaucetPayPayment(db, env, session) {
   }
 
   try {
-    // Record a missing API key as a failed attempt.
     if (!env.FAUCETPAY_API_KEY) {
       await db.prepare(`
         UPDATE payments
@@ -1410,11 +1471,7 @@ async function sendFaucetPayPayment(db, env, session) {
         WHERE id = ?
           AND session_id = ?
           AND status = 'PROCESSING'
-      `).bind(
-        unixTime(),
-        paymentId,
-        session.id
-      ).run();
+      `).bind(unixTime(), paymentId, session.id).run();
 
       return {
         ok: false,
@@ -1423,7 +1480,7 @@ async function sendFaucetPayPayment(db, env, session) {
       };
     }
 
-    // Exactly one outbound payment request. Never retry it.
+    // Exactly one outbound payment request. Do not retry.
     const response = await fetch(
       `${CONFIG.FAUCETPAY_API_BASE}/send`,
       {
@@ -1435,7 +1492,7 @@ async function sendFaucetPayPayment(db, env, session) {
         body: JSON.stringify({
           idempotency_key: idempotencyKey,
           to: email,
-          amount: CONFIG.MONETAG_REWARD_UNITS,
+          amount: rewardUnits,
           currency: CONFIG.MONETAG_REWARD_CURRENCY
         }),
         signal: AbortSignal.timeout(15000)
@@ -1485,33 +1542,6 @@ async function sendFaucetPayPayment(db, env, session) {
       };
     }
 
-    // FaucetPay did not provide a confirmed successful payment.
-// Treat the outcome as UNKNOWN until it can be reconciled.
-await db.prepare(`
-  UPDATE payments
-  SET status = 'UNKNOWN',
-      updated_at = ?
-  WHERE id = ?
-    AND session_id = ?
-    AND status = 'PROCESSING'
-`).bind(
-  unixTime(),
-  paymentId,
-  session.id
-).run();
-
-return {
-  ok: false,
-  status: "UNKNOWN",
-  error: "Payment outcome requires reconciliation."
-};
-
-  } catch (error) {
-  console.error("FaucetPay payment error:", error);
-
-  // The request may have reached FaucetPay.
-  // Never retry an uncertain payment.
-  try {
     await db.prepare(`
       UPDATE payments
       SET status = 'UNKNOWN',
@@ -1525,20 +1555,44 @@ return {
       session.id
     ).run();
 
-  } catch (databaseError) {
-    console.error(
-      "Could not record uncertain FaucetPay payment:",
-      databaseError
-    );
-  }
+    return {
+      ok: false,
+      status: "UNKNOWN",
+      error: "Payment outcome requires reconciliation."
+    };
 
-  return {
-    ok: false,
-    status: "UNKNOWN",
-    error: "Payment outcome is uncertain. Reconciliation is required."
-  };
+  } catch (error) {
+    console.error("FaucetPay payment error:", error);
+
+    // The request may have reached FaucetPay. Never retry it.
+    try {
+      await db.prepare(`
+        UPDATE payments
+        SET status = 'UNKNOWN',
+            updated_at = ?
+        WHERE id = ?
+          AND session_id = ?
+          AND status = 'PROCESSING'
+      `).bind(
+        unixTime(),
+        paymentId,
+        session.id
+      ).run();
+
+    } catch (databaseError) {
+      console.error(
+        "Could not record uncertain FaucetPay payment:",
+        databaseError
+      );
+    }
+
+    return {
+      ok: false,
+      status: "UNKNOWN",
+      error: "Payment outcome is uncertain. Reconciliation is required."
+    };
   }
-      }
+}
 // ==========================================
 // MONETAG REWARD COORDINATOR
 // READ-ONLY TEST VERSION
