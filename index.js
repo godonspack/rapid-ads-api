@@ -890,6 +890,10 @@ async function handleMonetagPostback(request, env) {
     const url = new URL(request.url);
     const params = url.searchParams;
 
+    // --------------------------------------------------------
+    // 1. VERIFY POSTBACK SECRET
+    // --------------------------------------------------------
+
     const suppliedSecret = params.get("secret") || "";
 
     if (!timingSafeEqual(
@@ -902,13 +906,48 @@ async function handleMonetagPostback(request, env) {
       }, 401);
     }
 
-    const ymid = params.get("ymid");
-    const zone = params.get("zone_id");
-    const event = params.get("event_type");
-    const rewardType = params.get("reward_event_type");
+    // --------------------------------------------------------
+    // 2. READ MONETAG POSTBACK PARAMETERS
+    // --------------------------------------------------------
 
-    if (!ymid || zone !== CONFIG.MONETAG_ZONE_ID) {
-      throw new Error("Invalid Monetag postback details.");
+    const ymid = params.get("ymid") || "";
+    const zone = params.get("zone_id") || "";
+    const event = params.get("event_type") || "";
+    const rewardType = params.get("reward_event_type") || "";
+    const requestVar = params.get("request_var") || "";
+
+    // --------------------------------------------------------
+    // 3. REJECT NON-REWARDED AD PLACEMENTS
+    // --------------------------------------------------------
+    // Rewarded Watch Ads sessions use:
+    // requestVar: "rapid_ads_watch"
+    //
+    // In-App Interstitial interface ads use:
+    // request_var: "auto"
+    //
+    // Interface ads must never trigger user payouts.
+
+    if (requestVar !== "rapid_ads_watch") {
+      return jsonResponse({
+        ok: true,
+        ignored: true,
+        payout_status: "NOT_REWARD_ELIGIBLE",
+        message: "This Monetag placement is not eligible for a user reward."
+      });
+    }
+
+    // --------------------------------------------------------
+    // 4. VALIDATE REWARDED EVENT
+    // --------------------------------------------------------
+
+    if (
+      !/^[a-zA-Z0-9_-]{1,200}$/.test(ymid) ||
+      zone !== CONFIG.MONETAG_ZONE_ID
+    ) {
+      return jsonResponse({
+        ok: false,
+        error: "Invalid Monetag postback details."
+      }, 400);
     }
 
     if (
@@ -921,6 +960,10 @@ async function handleMonetagPostback(request, env) {
         message: "Event is not reward eligible."
       });
     }
+
+    // --------------------------------------------------------
+    // 5. FIND THE REGISTERED SESSION
+    // --------------------------------------------------------
 
     const db = getDatabase(env);
 
@@ -936,10 +979,16 @@ async function handleMonetagPostback(request, env) {
     `).bind(ymid).first();
 
     if (!session) {
-      throw new Error("Monetag session not found.");
+      return jsonResponse({
+        ok: false,
+        error: "Monetag session not found."
+      }, 404);
     }
-    // Temporary live-payment test restriction.
-    // Only the approved Telegram account may trigger a FaucetPay payout.
+
+    // --------------------------------------------------------
+    // 6. TEMPORARY LIVE-PAYMENT TEST RESTRICTION
+    // --------------------------------------------------------
+
     if (CONFIG.PAYOUTS_ENABLED) {
       const allowedTelegramId = String(
         env.FAUCETPAY_TEST_TELEGRAM_ID || ""
@@ -956,30 +1005,45 @@ async function handleMonetagPostback(request, env) {
           message: "This account is not authorised for the temporary payout test."
         });
       }
-      }
+    }
+
+    // --------------------------------------------------------
+    // 7. VALIDATE REWARD AMOUNT
+    // --------------------------------------------------------
+
     const rewardUnits = Number(session.reward_units);
 
-if (
-  !Number.isSafeInteger(rewardUnits) ||
-  rewardUnits !== CONFIG.MONETAG_REWARD_UNITS
-) {
-  throw new Error("Invalid reward amount.");
-}
+    if (
+      !Number.isSafeInteger(rewardUnits) ||
+      rewardUnits !== CONFIG.MONETAG_REWARD_UNITS
+    ) {
+      throw new Error("Invalid reward amount.");
+    }
 
-// Ensure the cooldown exists without restarting an existing session's timer.
-await ensureMonetagCooldown(db, session);
+    // --------------------------------------------------------
+    // 8. ENSURE COOLDOWN EXISTS
+    // --------------------------------------------------------
 
-if (session.status !== "PENDING") {
-  return jsonResponse({
-    ok: true,
-    duplicate: true,
-    status: session.status
-  });
-}
+    await ensureMonetagCooldown(db, session);
 
-const now = unixTime();
+    // --------------------------------------------------------
+    // 9. PREVENT DUPLICATE SESSION PROCESSING
+    // --------------------------------------------------------
 
-    // Payouts disabled: verify the event without attempting payment.
+    if (session.status !== "PENDING") {
+      return jsonResponse({
+        ok: true,
+        duplicate: true,
+        status: session.status
+      });
+    }
+
+    const now = unixTime();
+
+    // --------------------------------------------------------
+    // 10. HANDLE DISABLED PAYOUTS
+    // --------------------------------------------------------
+
     if (!CONFIG.PAYOUTS_ENABLED) {
       await db.prepare(`
         UPDATE monetag_sessions
@@ -997,14 +1061,20 @@ const now = unixTime();
       });
     }
 
-        // Make exactly one payout attempt for this session.
+    // --------------------------------------------------------
+    // 11. MAKE THE ONE ALLOWED PAYOUT ATTEMPT
+    // --------------------------------------------------------
+
     const paymentResult = await sendFaucetPayPayment(
       db,
       env,
       session
     );
 
-    // An existing attempt must never trigger another payment.
+    // --------------------------------------------------------
+    // 12. EXISTING PAYMENT OR DUPLICATE ATTEMPT
+    // --------------------------------------------------------
+
     if (
       paymentResult.status === "PROCESSING" ||
       paymentResult.status === "DUPLICATE"
@@ -1017,7 +1087,10 @@ const now = unixTime();
       });
     }
 
-    // A confirmed payment.
+    // --------------------------------------------------------
+    // 13. CONFIRMED PAYMENT
+    // --------------------------------------------------------
+
     if (paymentResult.status === "PAID") {
       await db.prepare(`
         UPDATE monetag_sessions
@@ -1041,8 +1114,10 @@ const now = unixTime();
       });
     }
 
-    // Payouts disabled: do not mark the session as failed.
-    // This is a development safeguard, not a failed payment.
+    // --------------------------------------------------------
+    // 14. DISABLED PAYMENT RESULT
+    // --------------------------------------------------------
+
     if (paymentResult.status === "DISABLED") {
       return jsonResponse({
         ok: true,
@@ -1052,8 +1127,12 @@ const now = unixTime();
       });
     }
 
-        // An uncertain payment must remain unresolved.
-    // Never retry or allow another session to bypass it.
+    // --------------------------------------------------------
+    // 15. UNKNOWN PAYMENT RESULT
+    // --------------------------------------------------------
+    // Never retry an uncertain payment.
+    // The original payment must be reconciled.
+
     if (paymentResult.status === "UNKNOWN") {
       return jsonResponse({
         ok: true,
@@ -1063,7 +1142,12 @@ const now = unixTime();
       }, 202);
     }
 
-    // A definitively failed payment attempt is final.
+    // --------------------------------------------------------
+    // 16. DEFINITIVELY FAILED PAYMENT
+    // --------------------------------------------------------
+    // A failed attempt is final for this session.
+    // A new session is required for another attempt.
+
     if (paymentResult.status === "FAILED") {
       await db.prepare(`
         UPDATE monetag_sessions
@@ -1084,6 +1168,10 @@ const now = unixTime();
       });
     }
 
+    // --------------------------------------------------------
+    // 17. UNEXPECTED PAYMENT RESULT
+    // --------------------------------------------------------
+
     console.error(
       "Unexpected FaucetPay payment status:",
       paymentResult.status
@@ -1095,7 +1183,8 @@ const now = unixTime();
       payout_status: "UNKNOWN",
       error: "Unexpected payment status. No retry was attempted."
     }, 500);
-    } catch (error) {
+
+  } catch (error) {
     console.error("Monetag postback error:", error);
 
     return jsonResponse({
@@ -1103,7 +1192,7 @@ const now = unixTime();
       error: "Postback processing failed."
     }, 400);
   }
-      }
+          }
 
 // ============================================================
 // PAYMENT HISTORY
