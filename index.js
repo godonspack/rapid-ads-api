@@ -754,7 +754,7 @@ return jsonResponse({
   }
 }
 // ============================================================
-// REGISTER MONETAG SESSION
+// MONETAG SESSION REGISTRATION
 // ============================================================
 
 async function handleMonetagRegister(request, env) {
@@ -765,7 +765,7 @@ async function handleMonetagRegister(request, env) {
     const ymid = String(body.ymid || "");
     const reservationToken = String(body.reservation_token || "");
 
-    if (!ymid || ymid.length > 150) {
+    if (!/^[a-zA-Z0-9_-]{1,150}$/.test(ymid)) {
       throw new Error("Invalid Monetag session ID.");
     }
 
@@ -782,10 +782,11 @@ async function handleMonetagRegister(request, env) {
     const now = unixTime();
     const dailyCount = await getMonetagDailyCount(db, user.id);
 
-if (dailyCount >= CONFIG.MONETAG_DAILY_LIMIT) {
-  throw new Error("Daily Monetag limit reached.");
-}
-    // Block new sessions while an earlier payment is unresolved.
+    if (dailyCount >= CONFIG.MONETAG_DAILY_LIMIT) {
+      throw new Error("Daily Monetag limit reached.");
+    }
+
+    // Block registration while a payment is unresolved.
     const unresolvedPayment = await db.prepare(`
       SELECT p.id
       FROM payments p
@@ -801,66 +802,108 @@ if (dailyCount >= CONFIG.MONETAG_DAILY_LIMIT) {
         "You have an unresolved payment. Please wait for reconciliation before starting another ad session."
       );
     }
-    const reservation = await db.prepare(`
-  SELECT reservation_token
-  FROM monetag_reservations
-  WHERE telegram_id = ?
-    AND reservation_token = ?
-    AND expires_at >= ?
-`).bind(user.id, reservationToken, now).first();
-
-if (!reservation) {
-  throw new Error("Reservation is invalid or expired.");
-}
-
-    const duplicate = await db.prepare(`
-      SELECT id
-      FROM monetag_sessions
-      WHERE ymid = ?
-    `).bind(ymid).first();
-
-    if (duplicate) {
-      throw new Error("This Monetag session has already been registered.");
-    }
 
     const id = randomId("monetag");
 
-    // Insert the session only if its reservation still exists and is valid.
-const insertResult = await db.prepare(`
-  INSERT INTO monetag_sessions (
-    id,
-    telegram_id,
-    ymid,
-    status,
-    reward_units,
-    created_at,
-    reservation_token,
-    faucetpay_email
-  )
-  SELECT ?, ?, ?, 'PENDING', ?, ?, ?, ?
-  WHERE EXISTS (
-    SELECT 1
-    FROM monetag_reservations
-    WHERE telegram_id = ?
-      AND reservation_token = ?
-      AND expires_at >= ?
-  )
-`).bind(
-  id,
-  user.id,
-  ymid,
-  CONFIG.MONETAG_REWARD_UNITS,
-  now,
-  reservationToken,
-  registeredUser.faucetpay_email,
-  user.id,
-  reservationToken,
-  now
-).run();
+    // --------------------------------------------------------
+    // ATOMIC SESSION INSERT AND RESERVATION CONSUMPTION
+    // --------------------------------------------------------
+    // D1 batch executes these statements transactionally.
+    // The reservation is consumed only if this exact session
+    // was successfully inserted.
 
-if (Number(insertResult.meta?.changes || 0) === 0) {
-  throw new Error("Reservation is invalid, expired, or cancelled.");
-}
+    const results = await db.batch([
+
+      db.prepare(`
+        INSERT INTO monetag_sessions (
+          id,
+          telegram_id,
+          ymid,
+          status,
+          reward_units,
+          created_at,
+          reservation_token,
+          faucetpay_email
+        )
+        SELECT
+          ?, ?, ?, 'PENDING', ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1
+          FROM monetag_reservations
+          WHERE telegram_id = ?
+            AND reservation_token = ?
+            AND expires_at >= ?
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM monetag_sessions
+          WHERE ymid = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM payments p
+          INNER JOIN monetag_sessions ms
+            ON ms.id = p.session_id
+          WHERE ms.telegram_id = ?
+            AND p.status IN ('PROCESSING', 'UNKNOWN')
+        )
+        AND (
+          SELECT COUNT(*)
+          FROM monetag_sessions
+          WHERE telegram_id = ?
+            AND created_at >= ?
+            AND created_at < ?
+        ) < ?
+      `).bind(
+        id,
+        user.id,
+        ymid,
+        CONFIG.MONETAG_REWARD_UNITS,
+        now,
+        reservationToken,
+        registeredUser.faucetpay_email,
+        user.id,
+        reservationToken,
+        now,
+        ymid,
+        user.id,
+        user.id,
+        Math.floor(now / 86400) * 86400,
+        (Math.floor(now / 86400) + 1) * 86400,
+        CONFIG.MONETAG_DAILY_LIMIT
+      ),
+
+      // Delete only the reservation consumed by this insertion.
+      db.prepare(`
+        DELETE FROM monetag_reservations
+        WHERE telegram_id = ?
+          AND reservation_token = ?
+          AND EXISTS (
+            SELECT 1
+            FROM monetag_sessions
+            WHERE id = ?
+              AND telegram_id = ?
+              AND ymid = ?
+              AND reservation_token = ?
+          )
+      `).bind(
+        user.id,
+        reservationToken,
+        id,
+        user.id,
+        ymid,
+        reservationToken
+      )
+
+    ]);
+
+    const inserted = Number(results[0]?.meta?.changes || 0);
+
+    if (inserted !== 1) {
+      throw new Error(
+        "Registration failed. Your reservation may have expired, already been used, or your daily limit may have been reached."
+      );
+    }
 
     return jsonResponse({
       ok: true,
