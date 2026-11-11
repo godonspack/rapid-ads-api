@@ -17,6 +17,8 @@ const CONFIG = {
   // Rewarded Popup
   MONETAG_POPUP_REWARD_UNITS: 20000,
   MONETAG_POPUP_DAILY_LIMIT: 50,
+  MONETAG_POPUP_COOLDOWN_SECONDS: 60,
+  MONETAG_POPUP_REUSE_SECONDS: 900,
   MONETAG_POPUP_PREFIX: "rapop_",
 
   MONETAG_REWARD_CURRENCY: "USDT",
@@ -25,7 +27,6 @@ const CONFIG = {
   FAUCETPAY_API_BASE: "https://faucetpay.io/api/v2",
   TELEGRAM_AUTH_MAX_AGE: 86400,
 
-  // Preserved from your existing configuration.
   PAYOUTS_ENABLED: true
 };
 
@@ -171,7 +172,7 @@ function timingSafeEqual(a, b) {
 }
 
 // ============================================================
-// TELEGRAM AUTHENTICATION
+// CRYPTOGRAPHIC HELPERS
 // ============================================================
 
 async function hmacSha256(key, message) {
@@ -200,6 +201,10 @@ function bytesToHex(bytes) {
     .map(byte => byte.toString(16).padStart(2, "0"))
     .join("");
 }
+
+// ============================================================
+// TELEGRAM AUTHENTICATION
+// ============================================================
 
 async function verifyTelegramInitData(initData, botToken) {
   if (!initData || !botToken) {
@@ -303,7 +308,46 @@ function validFaucetPayEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
 }
 
-async function registerFaucetPayEmail(db, user, email) {
+// ============================================================
+// IP REGISTRATION PROTECTION
+// ============================================================
+
+async function getIpHash(request, env) {
+  if (!env.IP_HASH_SECRET) {
+    throw new Error("IP_HASH_SECRET is not configured.");
+  }
+
+  // Only trust Cloudflare's connection IP header.
+  // Never use a client-supplied IP address.
+  const ip = String(
+    request.headers.get("CF-Connecting-IP") || ""
+  ).trim().toLowerCase();
+
+  if (!ip || ip.length > 100) {
+    throw new Error("Unable to identify your connection IP.");
+  }
+
+  const hash = await hmacSha256(
+    new TextEncoder().encode(env.IP_HASH_SECRET),
+    ip
+  );
+
+  return bytesToHex(hash);
+}
+
+function isConstraintError(error) {
+  return String(error?.message || "")
+    .toLowerCase()
+    .includes("constraint");
+}
+
+async function registerFaucetPayEmail(
+  db,
+  request,
+  env,
+  user,
+  email
+) {
   if (!validFaucetPayEmail(email)) {
     throw new Error("Enter a valid FaucetPay email address.");
   }
@@ -311,29 +355,121 @@ async function registerFaucetPayEmail(db, user, email) {
   const normalizedEmail = email.trim().toLowerCase();
   const now = unixTime();
 
-  await db.prepare(`
-    INSERT INTO users (
-      telegram_id,
-      faucetpay_email,
-      created_at,
-      updated_at
-    )
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(telegram_id)
-    DO UPDATE SET
-      faucetpay_email = excluded.faucetpay_email,
-      updated_at = excluded.updated_at
-  `).bind(
-    user.id,
-    normalizedEmail,
-    now,
-    now
-  ).run();
+  const existingUser = await getRegisteredUser(db, user.id);
 
-  return {
-    registered: true,
-    faucetpay_email: normalizedEmail
-  };
+  // Existing accounts can update their email.
+  // They do not need to claim another IP address.
+  if (existingUser) {
+    await db.prepare(`
+      UPDATE users
+      SET faucetpay_email = ?,
+          updated_at = ?
+      WHERE telegram_id = ?
+    `).bind(
+      normalizedEmail,
+      now,
+      user.id
+    ).run();
+
+    return {
+      registered: true,
+      faucetpay_email: normalizedEmail,
+      existing_account: true
+    };
+  }
+
+  const ipHash = await getIpHash(request, env);
+
+  try {
+    // D1 batch executes these statements transactionally.
+    // If the IP claim violates a UNIQUE constraint,
+    // the user insertion is rolled back as well.
+    const results = await db.batch([
+      db.prepare(`
+        INSERT INTO users (
+          telegram_id,
+          faucetpay_email,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?)
+      `).bind(
+        user.id,
+        normalizedEmail,
+        now,
+        now
+      ),
+
+      db.prepare(`
+        INSERT INTO ip_registrations (
+          ip_hash,
+          telegram_id,
+          created_at
+        )
+        VALUES (?, ?, ?)
+      `).bind(
+        ipHash,
+        user.id,
+        now
+      )
+    ]);
+
+    if (
+      Number(results[0]?.meta?.changes || 0) !== 1 ||
+      Number(results[1]?.meta?.changes || 0) !== 1
+    ) {
+      throw new Error("Registration could not be completed.");
+    }
+
+    return {
+      registered: true,
+      faucetpay_email: normalizedEmail,
+      existing_account: false
+    };
+
+  } catch (error) {
+    if (!isConstraintError(error)) {
+      throw error;
+    }
+
+    // Check whether another account already owns this IP.
+    const ipOwner = await db.prepare(`
+      SELECT telegram_id
+      FROM ip_registrations
+      WHERE ip_hash = ?
+    `).bind(ipHash).first();
+
+    if (ipOwner && ipOwner.telegram_id !== user.id) {
+      throw new Error(
+        "Registration blocked: another Telegram account has already registered from this public IP address."
+      );
+    }
+
+    // A concurrent registration for this same Telegram account
+    // may have completed first.
+    const currentUser = await getRegisteredUser(db, user.id);
+
+    if (currentUser) {
+      await db.prepare(`
+        UPDATE users
+        SET faucetpay_email = ?,
+            updated_at = ?
+        WHERE telegram_id = ?
+      `).bind(
+        normalizedEmail,
+        now,
+        user.id
+      ).run();
+
+      return {
+        registered: true,
+        faucetpay_email: normalizedEmail,
+        existing_account: true
+      };
+    }
+
+    throw new Error("Registration failed. Please try again.");
+  }
 }
 
 async function getRegisteredUser(db, telegramId) {
@@ -367,6 +503,8 @@ async function handleFaucetPayEmail(request, env) {
 
     const result = await registerFaucetPayEmail(
       db,
+      request,
+      env,
       user,
       body.faucetpay_email
     );
@@ -419,7 +557,7 @@ async function getPopupDailyCount(db, telegramId) {
 }
 
 // ============================================================
-// MONETAG COOLDOWN
+// MONETAG INTERSTITIAL COOLDOWN
 // ============================================================
 
 async function getMonetagCooldown(db, telegramId) {
@@ -468,6 +606,28 @@ async function ensureMonetagCooldown(db, session) {
     session.id,
     now
   ).run();
+}
+
+// ============================================================
+// MONETAG POPUP COOLDOWN
+// ============================================================
+
+async function getMonetagPopupCooldown(db, telegramId) {
+  const latest = await db.prepare(`
+    SELECT finished_at
+    FROM monetag_popup_cooldowns
+    WHERE telegram_id = ?
+  `).bind(telegramId).first();
+
+  if (!latest) {
+    return 0;
+  }
+
+  return Math.max(
+    0,
+    CONFIG.MONETAG_POPUP_COOLDOWN_SECONDS -
+      (unixTime() - Number(latest.finished_at))
+  );
 }
 
 // ============================================================
@@ -706,7 +866,7 @@ async function handleMonetagCooldown(request, env) {
       ).run();
 
     } catch (error) {
-      if (String(error.message || "").includes("constraint")) {
+      if (isConstraintError(error)) {
         return jsonResponse({
           ok: false,
           can_watch: false,
@@ -900,8 +1060,7 @@ async function handleMonetagPopupPrepare(request, env) {
       }, 409);
     }
 
-    // Reuse a recent pending popup session rather than creating
-    // multiple sessions when the frontend requests preparation again.
+    // Reuse a recent pending session.
     const existing = await db.prepare(`
       SELECT ymid, created_at
       FROM monetag_sessions
@@ -911,7 +1070,10 @@ async function handleMonetagPopupPrepare(request, env) {
         AND created_at >= ?
       ORDER BY created_at DESC
       LIMIT 1
-    `).bind(user.id, now - 900).first();
+    `).bind(
+      user.id,
+      now - CONFIG.MONETAG_POPUP_REUSE_SECONDS
+    ).first();
 
     const dailyCount = await getPopupDailyCount(db, user.id);
     const dailyRemaining = Math.max(
@@ -926,8 +1088,20 @@ async function handleMonetagPopupPrepare(request, env) {
         reused: true,
         ymid: existing.ymid,
         daily_count: dailyCount,
-        daily_remaining: dailyRemaining
+        daily_remaining: dailyRemaining,
+        cooldown_seconds: CONFIG.MONETAG_POPUP_COOLDOWN_SECONDS
       });
+    }
+
+    const remaining = await getMonetagPopupCooldown(db, user.id);
+
+    if (remaining > 0) {
+      return jsonResponse({
+        ok: false,
+        can_watch: false,
+        remaining_seconds: remaining,
+        error: "Rewarded Popup is on cooldown."
+      }, 429);
     }
 
     if (dailyRemaining <= 0) {
@@ -945,63 +1119,104 @@ async function handleMonetagPopupPrepare(request, env) {
     const dayStart = utcDayStart();
     const dayEnd = dayStart + 86400;
 
-    // The insert itself enforces the daily cap and unresolved-payment
-    // restriction, including concurrent preparation requests.
-    const inserted = await db.prepare(`
-      INSERT INTO monetag_sessions (
-        id,
-        telegram_id,
-        ymid,
-        status,
-        reward_units,
-        created_at,
-        reservation_token,
-        faucetpay_email
-      )
-      SELECT
-        ?, ?, ?, 'PENDING', ?, ?, NULL, ?
-      WHERE
-        (
-          SELECT COUNT(*)
-          FROM monetag_sessions
-          WHERE telegram_id = ?
-            AND ymid LIKE 'rapop_%'
-            AND created_at >= ?
-            AND created_at < ?
-        ) < ?
-        AND NOT EXISTS (
-          SELECT 1
-          FROM payments p
-          INNER JOIN monetag_sessions ms ON ms.id = p.session_id
-          WHERE ms.telegram_id = ?
-            AND p.status IN ('PROCESSING', 'UNKNOWN')
+    // Session and cooldown are written together.
+    // The cooldown starts at preparation time.
+    const results = await db.batch([
+      db.prepare(`
+        INSERT INTO monetag_sessions (
+          id,
+          telegram_id,
+          ymid,
+          status,
+          reward_units,
+          created_at,
+          reservation_token,
+          faucetpay_email
         )
-    `).bind(
-      id,
-      user.id,
-      ymid,
-      CONFIG.MONETAG_POPUP_REWARD_UNITS,
-      now,
-      registeredUser.faucetpay_email,
-      user.id,
-      dayStart,
-      dayEnd,
-      CONFIG.MONETAG_POPUP_DAILY_LIMIT,
-      user.id
-    ).run();
+        SELECT
+          ?, ?, ?, 'PENDING', ?, ?, NULL, ?
+        WHERE
+          (
+            SELECT COUNT(*)
+            FROM monetag_sessions
+            WHERE telegram_id = ?
+              AND ymid LIKE 'rapop_%'
+              AND created_at >= ?
+              AND created_at < ?
+          ) < ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM payments p
+            INNER JOIN monetag_sessions ms ON ms.id = p.session_id
+            WHERE ms.telegram_id = ?
+              AND p.status IN ('PROCESSING', 'UNKNOWN')
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM monetag_popup_cooldowns
+            WHERE telegram_id = ?
+              AND finished_at > ?
+          )
+      `).bind(
+        id,
+        user.id,
+        ymid,
+        CONFIG.MONETAG_POPUP_REWARD_UNITS,
+        now,
+        registeredUser.faucetpay_email,
+        user.id,
+        dayStart,
+        dayEnd,
+        CONFIG.MONETAG_POPUP_DAILY_LIMIT,
+        user.id,
+        user.id,
+        now - CONFIG.MONETAG_POPUP_COOLDOWN_SECONDS
+      ),
 
-    if (Number(inserted.meta?.changes || 0) !== 1) {
-      const latestCount = await getPopupDailyCount(db, user.id);
+      db.prepare(`
+        INSERT INTO monetag_popup_cooldowns (
+          telegram_id,
+          session_id,
+          finished_at
+        )
+        SELECT ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1
+          FROM monetag_sessions
+          WHERE id = ?
+            AND telegram_id = ?
+            AND ymid = ?
+        )
+        ON CONFLICT(telegram_id)
+        DO UPDATE SET
+          session_id = excluded.session_id,
+          finished_at = excluded.finished_at
+        WHERE (
+          SELECT rowid
+          FROM monetag_sessions
+          WHERE id = excluded.session_id
+        ) > (
+          SELECT rowid
+          FROM monetag_sessions
+          WHERE id = monetag_popup_cooldowns.session_id
+        )
+      `).bind(
+        user.id,
+        id,
+        now,
+        id,
+        user.id,
+        ymid
+      )
+    ]);
 
+    if (
+      Number(results[0]?.meta?.changes || 0) !== 1 ||
+      Number(results[1]?.meta?.changes || 0) !== 1
+    ) {
       return jsonResponse({
         ok: false,
-        limit_reached: latestCount >= CONFIG.MONETAG_POPUP_DAILY_LIMIT,
-        daily_count: latestCount,
-        daily_remaining: Math.max(
-          0,
-          CONFIG.MONETAG_POPUP_DAILY_LIMIT - latestCount
-        ),
-        error: "Unable to prepare a Popup session. Please try again."
+        error: "Unable to prepare Popup session. Please check your cooldown and daily limit."
       }, 409);
     }
 
@@ -1016,7 +1231,8 @@ async function handleMonetagPopupPrepare(request, env) {
       daily_remaining: Math.max(
         0,
         CONFIG.MONETAG_POPUP_DAILY_LIMIT - updatedCount
-      )
+      ),
+      cooldown_seconds: CONFIG.MONETAG_POPUP_COOLDOWN_SECONDS
     });
 
   } catch (error) {
@@ -1094,13 +1310,18 @@ async function handleMonetagPostback(request, env) {
       }, 400);
     }
 
-    if (
-      !["impression", "click"].includes(event) ||
-      rewardType !== "valued"
-    ) {
+    // Interstitial accepts valued impressions or valued clicks.
+    // Popup accepts ONLY valued clicks.
+    const eligibleEvent = placement === "popup"
+      ? event === "click" && rewardType === "valued"
+      : ["impression", "click"].includes(event) &&
+        rewardType === "valued";
+
+    if (!eligibleEvent) {
       return jsonResponse({
         ok: true,
         ignored: true,
+        payout_status: "NOT_REWARD_ELIGIBLE",
         message: "Event is not reward eligible."
       });
     }
@@ -1173,13 +1394,12 @@ async function handleMonetagPostback(request, env) {
       throw new Error("Invalid reward amount for this placement.");
     }
 
-    // Popup rewards do not create an Interstitial cooldown.
+    // Popup never creates an Interstitial cooldown.
+    // Interstitial cooldown is started by finish_watch.
     if (placement === "interstitial") {
       await ensureMonetagCooldown(db, session);
     }
 
-    // A valued impression and valued click can both arrive for the
-    // same Popup ymid. Only the first event may initiate payment.
     if (session.status !== "PENDING") {
       return jsonResponse({
         ok: true,
@@ -1435,7 +1655,7 @@ async function sendFaucetPayPayment(db, env, session) {
       updated_at
     )
     VALUES (?, ?, ?, ?, ?, 'PROCESSING', ?, ?, ?, ?)
-    ON CONFLICT(session_id) DO NOTHING
+    ON CONFLICT(session_id) WHERE session_id IS NOT NULL DO NOTHING
   `).bind(
     paymentId,
     session.telegram_id,
@@ -1592,7 +1812,7 @@ async function sendFaucetPayPayment(db, env, session) {
       error: "Payment outcome is uncertain. Reconciliation is required."
     };
   }
-}
+ }
 // ==========================================
 // MONETAG REWARD COORDINATOR
 // READ-ONLY TEST VERSION
@@ -2590,4 +2810,4 @@ if (data.action === "recover_reward_processing_test") {
       read_only: true
     }, 400);
   }
-  }
+}
