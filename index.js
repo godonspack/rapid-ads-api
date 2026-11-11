@@ -546,8 +546,9 @@ async function getPopupDailyCount(db, telegramId) {
     SELECT COUNT(*) AS total
     FROM monetag_sessions
     WHERE telegram_id = ?
-      AND date(created_at, 'unixepoch') = ?
       AND ymid LIKE 'rapop_%'
+      AND verified_at IS NOT NULL
+      AND date(verified_at, 'unixepoch') = ?
   `).bind(
     telegramId,
     utcDateKey()
@@ -965,11 +966,11 @@ async function handleMonetagRegister(request, env) {
         )
         AND (
           SELECT COUNT(*)
-          FROM monetag_sessions
-          WHERE telegram_id = ?
-            AND ymid NOT LIKE 'rapop_%'
-            AND created_at >= ?
-            AND created_at < ?
+FROM monetag_sessions
+WHERE telegram_id = ?
+  AND ymid LIKE 'rapop_%'
+  AND verified_at IS NOT NULL
+  AND date(verified_at, 'unixepoch') = ?
         ) < ?
       `).bind(
         id,
@@ -985,9 +986,8 @@ async function handleMonetagRegister(request, env) {
         ymid,
         user.id,
         user.id,
-        dayStart,
-        dayEnd,
-        CONFIG.MONETAG_DAILY_LIMIT
+utcDateKey(),
+CONFIG.MONETAG_POPUP_DAILY_LIMIT
       ),
 
       db.prepare(`
@@ -1461,13 +1461,25 @@ const eligibleEvent =
     }
 
     if (paymentResult.status === "UNKNOWN") {
-      return jsonResponse({
-        ok: true,
-        verified: true,
-        payout_status: "UNKNOWN",
-        message: "Payment outcome is uncertain. Reconciliation is required. No retry was attempted."
-      }, 202);
-    }
+
+  await db.prepare(`
+    UPDATE monetag_sessions
+    SET status = 'UNKNOWN',
+        verified_at = COALESCE(verified_at, ?)
+    WHERE id = ?
+      AND status = 'PENDING'
+  `).bind(
+    now,
+    session.id
+  ).run();
+
+  return jsonResponse({
+    ok: true,
+    verified: true,
+    payout_status: "UNKNOWN",
+    message: "Payment outcome is uncertain. Reconciliation is required. No retry was attempted."
+  }, 202);
+  }
 
     if (paymentResult.status === "FAILED") {
       await db.prepare(`
