@@ -1310,13 +1310,11 @@ async function handleMonetagPostback(request, env) {
       }, 400);
     }
 
-    // Interstitial accepts valued impressions or valued clicks.
-    // Popup accepts ONLY valued clicks.
-    const eligibleEvent = placement === "popup"
-      ? event === "click" && rewardType === "valued"
-      : ["impression", "click"].includes(event) &&
-        rewardType === "valued";
-
+    // Both Interstitial and Popup accept valued impressions or valued clicks.
+// Each ymid can only be rewarded once.
+const eligibleEvent =
+  ["impression", "click"].includes(event) &&
+  rewardType === "valued";
     if (!eligibleEvent) {
       return jsonResponse({
         ok: true,
