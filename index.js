@@ -1096,13 +1096,15 @@ async function handleMonetagPopupPrepare(request, env) {
     const remaining = await getMonetagPopupCooldown(db, user.id);
 
     if (remaining > 0) {
-      return jsonResponse({
-        ok: false,
-        can_watch: false,
-        remaining_seconds: remaining,
-        error: "Rewarded Popup is on cooldown."
-      }, 429);
-    }
+  return jsonResponse({
+    ok: false,
+    can_watch: false,
+    remaining_seconds: remaining,
+    daily_count: dailyCount,
+    daily_remaining: dailyRemaining,
+    error: "Rewarded Popup is on cooldown."
+  }, 429);
+}
 
     if (dailyRemaining <= 0) {
       return jsonResponse({
