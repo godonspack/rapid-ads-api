@@ -642,6 +642,69 @@ async function handleMonetagCooldown(request, env) {
 
     const action = String(body.action || "check_cooldown");
     const now = unixTime();
+    if (action === "finish_popup_watch") {
+  const ymid = String(body.ymid || "");
+
+  if (!ymid.startsWith(CONFIG.MONETAG_POPUP_PREFIX)) {
+    throw new Error("Invalid Popup session ID.");
+  }
+
+  const session = await db.prepare(`
+    SELECT id, status
+    FROM monetag_sessions
+    WHERE telegram_id = ?
+      AND ymid = ?
+  `).bind(user.id, ymid).first();
+
+  if (!session) {
+    throw new Error("Popup session not found.");
+  }
+
+  // Start cooldown only once for this session.
+  await db.prepare(`
+    INSERT INTO monetag_popup_cooldowns (
+      telegram_id,
+      session_id,
+      finished_at
+    )
+    VALUES (?, ?, ?)
+    ON CONFLICT(telegram_id)
+    DO UPDATE SET
+      session_id = excluded.session_id,
+      finished_at = excluded.finished_at
+    WHERE
+      monetag_popup_cooldowns.session_id != excluded.session_id
+      AND (
+        SELECT rowid
+        FROM monetag_sessions
+        WHERE id = excluded.session_id
+      ) > (
+        SELECT rowid
+        FROM monetag_sessions
+        WHERE id = monetag_popup_cooldowns.session_id
+      )
+  `).bind(user.id, session.id, now).run();
+
+  const cooldown = await db.prepare(`
+    SELECT session_id, finished_at
+    FROM monetag_popup_cooldowns
+    WHERE telegram_id = ?
+  `).bind(user.id).first();
+
+  const remaining = cooldown?.session_id === session.id
+    ? Math.max(
+        0,
+        CONFIG.MONETAG_POPUP_COOLDOWN_SECONDS -
+          (now - Number(cooldown.finished_at))
+      )
+    : 0;
+
+  return jsonResponse({
+    ok: true,
+    cooldown_started: cooldown?.session_id === session.id,
+    remaining_seconds: remaining
+  });
+}
 
     if (action === "cancel_watch") {
       const token = String(body.reservation_token || "");
@@ -1124,103 +1187,63 @@ async function handleMonetagPopupPrepare(request, env) {
     // Session and cooldown are written together.
     // The cooldown starts at preparation time.
     const results = await db.batch([
-      db.prepare(`
-        INSERT INTO monetag_sessions (
-          id,
-          telegram_id,
-          ymid,
-          status,
-          reward_units,
-          created_at,
-          reservation_token,
-          faucetpay_email
-        )
-        SELECT
-          ?, ?, ?, 'PENDING', ?, ?, NULL, ?
-        WHERE
-          (
-            SELECT COUNT(*)
-            FROM monetag_sessions
-            WHERE telegram_id = ?
-              AND ymid LIKE 'rapop_%'
-              AND created_at >= ?
-              AND created_at < ?
-          ) < ?
-          AND NOT EXISTS (
-            SELECT 1
-            FROM payments p
-            INNER JOIN monetag_sessions ms ON ms.id = p.session_id
-            WHERE ms.telegram_id = ?
-              AND p.status IN ('PROCESSING', 'UNKNOWN')
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM monetag_popup_cooldowns
-            WHERE telegram_id = ?
-              AND finished_at > ?
-          )
-      `).bind(
-        id,
-        user.id,
-        ymid,
-        CONFIG.MONETAG_POPUP_REWARD_UNITS,
-        now,
-        registeredUser.faucetpay_email,
-        user.id,
-        dayStart,
-        dayEnd,
-        CONFIG.MONETAG_POPUP_DAILY_LIMIT,
-        user.id,
-        user.id,
-        now - CONFIG.MONETAG_POPUP_COOLDOWN_SECONDS
-      ),
-
-      db.prepare(`
-        INSERT INTO monetag_popup_cooldowns (
-          telegram_id,
-          session_id,
-          finished_at
-        )
-        SELECT ?, ?, ?
-        WHERE EXISTS (
-          SELECT 1
-          FROM monetag_sessions
-          WHERE id = ?
-            AND telegram_id = ?
-            AND ymid = ?
-        )
-        ON CONFLICT(telegram_id)
-        DO UPDATE SET
-          session_id = excluded.session_id,
-          finished_at = excluded.finished_at
-        WHERE (
-          SELECT rowid
-          FROM monetag_sessions
-          WHERE id = excluded.session_id
-        ) > (
-          SELECT rowid
-          FROM monetag_sessions
-          WHERE id = monetag_popup_cooldowns.session_id
-        )
-      `).bind(
-        user.id,
-        id,
-        now,
-        id,
-        user.id,
-        ymid
+  db.prepare(`
+    INSERT INTO monetag_sessions (
+      id,
+      telegram_id,
+      ymid,
+      status,
+      reward_units,
+      created_at,
+      reservation_token,
+      faucetpay_email
+    )
+    SELECT
+      ?, ?, ?, 'PENDING', ?, ?, NULL, ?
+    WHERE
+      (
+        SELECT COUNT(*)
+        FROM monetag_sessions
+        WHERE telegram_id = ?
+          AND ymid LIKE 'rapop_%'
+          AND verified_at IS NOT NULL
+          AND date(verified_at, 'unixepoch') = ?
+      ) < ?
+      AND NOT EXISTS (
+        SELECT 1
+        FROM payments p
+        INNER JOIN monetag_sessions ms ON ms.id = p.session_id
+        WHERE ms.telegram_id = ?
+          AND p.status IN ('PROCESSING', 'UNKNOWN')
       )
-    ]);
+      AND NOT EXISTS (
+        SELECT 1
+        FROM monetag_popup_cooldowns
+        WHERE telegram_id = ?
+          AND finished_at > ?
+      )
+  `).bind(
+    id,
+    user.id,
+    ymid,
+    CONFIG.MONETAG_POPUP_REWARD_UNITS,
+    now,
+    registeredUser.faucetpay_email,
+    user.id,
+    utcDateKey(),
+    CONFIG.MONETAG_POPUP_DAILY_LIMIT,
+    user.id,
+    user.id,
+    now - CONFIG.MONETAG_POPUP_COOLDOWN_SECONDS
+  )
+]);
 
-    if (
-      Number(results[0]?.meta?.changes || 0) !== 1 ||
-      Number(results[1]?.meta?.changes || 0) !== 1
-    ) {
-      return jsonResponse({
-        ok: false,
-        error: "Unable to prepare Popup session. Please check your cooldown and daily limit."
-      }, 409);
-    }
+if (Number(results[0]?.meta?.changes || 0) !== 1) {
+  return jsonResponse({
+    ok: false,
+    error: "Unable to prepare Popup session. Please check your cooldown and daily limit."
+  }, 409);
+}
 
     const updatedCount = await getPopupDailyCount(db, user.id);
 
