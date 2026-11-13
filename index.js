@@ -1621,13 +1621,23 @@ async function handlePaymentStatus(request, env) {
       });
     }
 
-    return jsonResponse({
+    const responseData = {
       ok: true,
       status: payment.payment_status || payment.session_status || "WAITING",
       amount_units: payment.amount_units || null,
       currency: payment.currency || null,
       faucetpay_reference: payment.faucetpay_reference || null
-    });
+    };
+
+    // Include the latest daily count for Popup sessions.
+    if (ymid.startsWith("rapop_")) {
+      const dailyCount = await getPopupDailyCount(db, user.id);
+
+      responseData.daily_count = dailyCount;
+      responseData.daily_remaining = Math.max(0, 50 - dailyCount);
+    }
+
+    return jsonResponse(responseData);
 
   } catch (error) {
     console.error("Payment status error:", error);
