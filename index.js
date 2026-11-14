@@ -487,119 +487,106 @@ async function getRegisteredUser(db, telegramId) {
 }
 
 
-async function hasChannelAccess(db, telegramId) {
-  // Existing Rapid Ads accounts keep their access.
-  const existingUser = await getRegisteredUser(db, telegramId);
-  if (existingUser) return true;
-
-  const membership = await db.prepare(`
-    SELECT telegram_id
-    FROM channel_memberships
-    WHERE telegram_id = ?
-  `).bind(telegramId).first();
-
-  return Boolean(membership);
-}
-
-async function requireChannelAccess(db, telegramId) {
-  if (!(await hasChannelAccess(db, telegramId))) {
-    throw new Error(
-      "Please join the official Rapid Ads Telegram channel and verify your membership before accessing the app."
-    );
+async function checkTelegramChannelMembership(env, telegramId) {
+  if (!env.TELEGRAM_BOT_TOKEN) {
+    throw new Error("Telegram bot authentication is not configured.");
   }
-  return true;
-}
 
-async function handleChannelMembership(request, env) {
+  let telegramResponse;
   try {
-    const { user } = await authenticateRequest(request, env);
-    const db = getDatabase(env);
-
-    // Existing registered users are grandfathered in.
-    const existingUser = await getRegisteredUser(db, user.id);
-    if (existingUser) {
-      return jsonResponse({
-        ok: true,
-        member: true,
-        verified: true,
-        existing_user: true
-      });
-    }
-
-    const savedMembership = await db.prepare(`
-      SELECT verified_at
-      FROM channel_memberships
-      WHERE telegram_id = ?
-    `).bind(user.id).first();
-
-    if (savedMembership) {
-      return jsonResponse({
-        ok: true,
-        member: true,
-        verified: true,
-        already_verified: true
-      });
-    }
-
-    if (!env.TELEGRAM_BOT_TOKEN) {
-      throw new Error("Telegram bot authentication is not configured.");
-    }
-
-    const telegramResponse = await fetch(
+    telegramResponse = await fetch(
       `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getChatMember`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: CONFIG.TELEGRAM_CHANNEL_ID,
-          user_id: Number(user.id)
+          user_id: Number(telegramId)
         })
       }
     );
+  } catch (error) {
+    console.error("Telegram membership request failed:", error);
+    throw new Error("Could not contact Telegram to verify your membership. Please try again.");
+  }
 
-    let telegramResult;
-    try {
-      telegramResult = await telegramResponse.json();
-    } catch {
-      throw new Error("Unable to read Telegram membership response.");
-    }
+  let telegramResult;
+  try {
+    telegramResult = await telegramResponse.json();
+  } catch {
+    throw new Error("Telegram returned an unreadable membership response. Please try again.");
+  }
 
-    if (!telegramResponse.ok || telegramResult?.ok !== true) {
-      console.error("Telegram membership verification failed:", telegramResult);
-      return jsonResponse({
-        ok: false,
-        error: "Telegram could not verify your membership. Please try again."
-      }, 502);
-    }
+  // Do not treat Telegram/API errors as a membership cancellation.
+  // Fail closed for access, but preserve the saved membership record for retry.
+  if (!telegramResponse.ok || telegramResult?.ok !== true) {
+    console.error("Telegram membership verification failed:", telegramResult);
+    throw new Error("Telegram could not verify your membership right now. Please try again shortly.");
+  }
 
-    const memberStatus = telegramResult.result?.status;
-    const isMember =
-      memberStatus === "creator" ||
-      memberStatus === "administrator" ||
-      memberStatus === "member" ||
-      (memberStatus === "restricted" &&
-       telegramResult.result?.is_member === true);
+  const memberStatus = telegramResult.result?.status;
+  return (
+    memberStatus === "creator" ||
+    memberStatus === "administrator" ||
+    memberStatus === "member" ||
+    (memberStatus === "restricted" && telegramResult.result?.is_member === true)
+  );
+}
+
+async function requireChannelAccess(db, env, telegramId) {
+  const isMember = await checkTelegramChannelMembership(env, telegramId);
+
+  if (isMember) {
+    await db.prepare(`
+      INSERT INTO channel_memberships (telegram_id, verified_at)
+      VALUES (?, ?)
+      ON CONFLICT(telegram_id) DO UPDATE SET verified_at = excluded.verified_at
+    `).bind(telegramId, unixTime()).run();
+    return true;
+  }
+
+  // Revoke the saved verification immediately when Telegram confirms
+  // that the user is no longer a member.
+  await db.prepare(`
+    DELETE FROM channel_memberships
+    WHERE telegram_id = ?
+  `).bind(telegramId).run();
+
+  throw new Error(
+    "Your Rapid Ads channel membership is no longer active. Please rejoin @rapidads_channel and verify your membership to continue."
+  );
+}
+
+async function handleChannelMembership(request, env) {
+  try {
+    const { user } = await authenticateRequest(request, env);
+    const db = getDatabase(env);
+    const isMember = await checkTelegramChannelMembership(env, user.id);
 
     if (!isMember) {
+      await db.prepare(`
+        DELETE FROM channel_memberships
+        WHERE telegram_id = ?
+      `).bind(user.id).run();
+
       return jsonResponse({
         ok: true,
         member: false,
         verified: false,
-        message: "Please join the Rapid Ads Telegram channel first."
+        message: "You are no longer a member of the Rapid Ads channel. Please rejoin and verify again."
       });
     }
 
     await db.prepare(`
       INSERT INTO channel_memberships (telegram_id, verified_at)
       VALUES (?, ?)
-      ON CONFLICT(telegram_id) DO NOTHING
+      ON CONFLICT(telegram_id) DO UPDATE SET verified_at = excluded.verified_at
     `).bind(user.id, unixTime()).run();
 
     return jsonResponse({
       ok: true,
       member: true,
-      verified: true,
-      already_verified: false
+      verified: true
     });
 
   } catch (error) {
@@ -631,7 +618,7 @@ async function handleFaucetPayEmail(request, env) {
   try {
     const { body, user } = await authenticateRequest(request, env);
     const db = getDatabase(env);
-    await requireChannelAccess(db, user.id);
+    await requireChannelAccess(db, env, user.id);
 
     const result = await registerFaucetPayEmail(
       db,
@@ -771,7 +758,7 @@ async function handleMonetagCooldown(request, env) {
   try {
     const { body, user } = await authenticateRequest(request, env);
     const db = getDatabase(env);
-    await requireChannelAccess(db, user.id);
+    await requireChannelAccess(db, env, user.id);
 
     const action = String(body.action || "check_cooldown");
     const now = unixTime();
@@ -1097,7 +1084,7 @@ async function handleMonetagRegister(request, env) {
   try {
     const { body, user } = await authenticateRequest(request, env);
     const db = getDatabase(env);
-    await requireChannelAccess(db, user.id);
+    await requireChannelAccess(db, env, user.id);
 
     const ymid = String(body.ymid || "");
     const reservationToken = String(body.reservation_token || "");
@@ -1238,7 +1225,7 @@ async function handleMonetagPopupPrepare(request, env) {
   try {
     const { user } = await authenticateRequest(request, env);
     const db = getDatabase(env);
-    await requireChannelAccess(db, user.id);
+    await requireChannelAccess(db, env, user.id);
     const now = unixTime();
 
     const registeredUser = await getRegisteredUser(db, user.id);
@@ -1683,7 +1670,7 @@ async function handlePaymentHistory(request, env) {
   try {
     const { user } = await authenticateRequest(request, env);
     const db = getDatabase(env);
-    await requireChannelAccess(db, user.id);
+    await requireChannelAccess(db, env, user.id);
 
     const payments = await db.prepare(`
       SELECT
@@ -1732,7 +1719,7 @@ async function handlePaymentStatus(request, env) {
     }
 
     const db = getDatabase(env);
-    await requireChannelAccess(db, user.id);
+    await requireChannelAccess(db, env, user.id);
 
     const payment = await db.prepare(`
       SELECT
