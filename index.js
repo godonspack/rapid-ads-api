@@ -2103,22 +2103,41 @@ async function handlePaymentHistory(request, env) {
   try {
     const { user } = await authenticateRequest(request, env);
     const db = getDatabase(env);
+
     await requireChannelAccess(db, env, user.id);
 
     const payments = await db.prepare(`
-      SELECT
-        id,
-        amount_units,
-        currency,
-        status,
-        faucetpay_reference,
-        created_at,
-        updated_at
-      FROM payments
-      WHERE telegram_id = ?
+      SELECT *
+      FROM (
+        SELECT
+          id,
+          amount_units,
+          currency,
+          status,
+          faucetpay_reference,
+          created_at,
+          updated_at,
+          'Monetag' AS source
+        FROM payments
+        WHERE telegram_id = ?
+
+        UNION ALL
+
+        SELECT
+          id,
+          amount_units,
+          currency,
+          status,
+          faucetpay_reference,
+          created_at,
+          updated_at,
+          'TELEMONIX' AS source
+        FROM telemonix_promo_claims
+        WHERE telegram_id = ?
+      )
       ORDER BY created_at DESC
       LIMIT 50
-    `).bind(user.id).all();
+    `).bind(user.id, user.id).all();
 
     return jsonResponse({
       ok: true,
