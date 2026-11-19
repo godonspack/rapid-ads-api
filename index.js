@@ -29,6 +29,11 @@ const CONFIG = {
   TELEGRAM_CHANNEL_ID: "@rapidads_channel",
   TELEGRAM_CHANNEL_URL: "https://t.me/rapidads_channel",
 
+    // LiteBits — safe mode (record rewards only; no payouts)
+  LITEBITS_PLACEMENT_ID: "bee02ff9-a9f0-41c0-987c-7762f4bda93e",
+  LITEBITS_REWARD_UNITS: 10000,
+  LITEBITS_MINIMUM_EARNING_SATS: 2,
+
   PAYOUTS_ENABLED: true
 };
 
@@ -90,6 +95,10 @@ export default {
       if (path === "/monetag-postback" && request.method === "GET") {
         return await handleMonetagPostback(request, env);
       }
+
+      if (path === "/litebits-callback" && request.method === "POST") {
+        return await handleLiteBitsCallback(request, env);
+       }
 
       if (path === "/payment-history" && request.method === "POST") {
         return await handlePaymentHistory(request, env);
@@ -1661,6 +1670,415 @@ const eligibleEvent =
     }, 400);
   }
 }
+
+// ============================================================
+// LITEBITS VERIFIED CALLBACK — SAFE MODE
+// Records verified events and pending rewards.
+// DOES NOT SEND FAUCETPAY PAYMENTS.
+// ============================================================
+
+function bytesToBase64Url(bytes) {
+  let binary = "";
+
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+async function handleLiteBitsCallback(request, env) {
+  try {
+    if (!env.LITEBITS_CALLBACK_SECRET) {
+      console.error("LITEBITS_CALLBACK_SECRET is missing.");
+
+      return jsonResponse({
+        ok: false,
+        error: "Callback authentication is not configured."
+      }, 500);
+    }
+
+    // --------------------------------------------------------
+    // 1. Read the exact raw body.
+    // Never parse and re-serialize before signature checking.
+    // --------------------------------------------------------
+
+    const rawBody = await request.text();
+
+    if (!rawBody || rawBody.length > 32768) {
+      return jsonResponse({
+        ok: false,
+        error: "Invalid callback body."
+      }, 400);
+    }
+
+    // --------------------------------------------------------
+    // 2. Read LiteBits signature headers.
+    // --------------------------------------------------------
+
+    const timestamp = request.headers.get("x-lba-timestamp") || "";
+    const headerEventId = request.headers.get("x-lba-event-id") || "";
+    const deliveryId = request.headers.get("x-lba-delivery-id") || "";
+    const receivedSignature = request.headers.get("x-lba-signature") || "";
+
+    if (
+      !/^\d{1,12}$/.test(timestamp) ||
+      !headerEventId ||
+      headerEventId.length > 128 ||
+      !deliveryId ||
+      deliveryId.length > 128 ||
+      !/^[A-Za-z0-9_-]+$/.test(receivedSignature)
+    ) {
+      return jsonResponse({
+        ok: false,
+        error: "Missing or invalid callback headers."
+      }, 400);
+    }
+
+    // --------------------------------------------------------
+    // 3. Verify timestamp freshness.
+    // Maximum permitted clock difference: 300 seconds.
+    // --------------------------------------------------------
+
+    const timestampNumber = Number(timestamp);
+    const now = unixTime();
+
+    if (
+      !Number.isSafeInteger(timestampNumber) ||
+      timestampNumber > now + 300 ||
+      now - timestampNumber > 300
+    ) {
+      return jsonResponse({
+        ok: false,
+        error: "Callback timestamp expired."
+      }, 401);
+    }
+
+    // --------------------------------------------------------
+    // 4. Verify HMAC-SHA256 over timestamp + raw body.
+    // --------------------------------------------------------
+
+    const signingMessage = `${timestamp}.${rawBody}`;
+
+    const expectedSignature = bytesToBase64Url(
+      await hmacSha256(
+        new TextEncoder().encode(env.LITEBITS_CALLBACK_SECRET),
+        signingMessage
+      )
+    );
+
+    if (!timingSafeEqual(expectedSignature, receivedSignature)) {
+      console.error("LiteBits callback signature verification failed.");
+
+      return jsonResponse({
+        ok: false,
+        error: "Invalid callback signature."
+      }, 401);
+    }
+
+    // --------------------------------------------------------
+    // 5. Parse JSON only after signature verification.
+    // --------------------------------------------------------
+
+    let payload;
+
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      return jsonResponse({
+        ok: false,
+        error: "Invalid callback JSON."
+      }, 400);
+    }
+
+    // --------------------------------------------------------
+    // 6. Validate callback event and identifiers.
+    // --------------------------------------------------------
+
+    const eventId = String(payload.event_id || "");
+    const placementId = String(payload.placement_id || "");
+    const eventType = String(payload.event || "");
+
+    if (
+      eventType !== "impression.verified" ||
+      !eventId ||
+      eventId.length > 128 ||
+      eventId !== headerEventId
+    ) {
+      return jsonResponse({
+        ok: false,
+        error: "Invalid or mismatched LiteBits event."
+      }, 400);
+    }
+
+    if (placementId !== CONFIG.LITEBITS_PLACEMENT_ID) {
+      return jsonResponse({
+        ok: false,
+        error: "Unrecognised LiteBits placement."
+      }, 400);
+    }
+
+    const telegramId = payload.telegram_user_id;
+
+    if (
+      !Number.isSafeInteger(telegramId) ||
+      telegramId <= 0
+    ) {
+      return jsonResponse({
+        ok: false,
+        error: "Invalid Telegram user ID."
+      }, 400);
+    }
+
+    const earningSats = payload.earning;
+
+    if (
+      !Number.isSafeInteger(earningSats) ||
+      earningSats < 0
+    ) {
+      return jsonResponse({
+        ok: false,
+        error: "Invalid LiteBits earning amount."
+      }, 400);
+    }
+
+    // --------------------------------------------------------
+    // 7. Validate occurred_at.
+    // --------------------------------------------------------
+
+    let occurredAt = null;
+    let eventDay = utcDateKey();
+
+    if (payload.occurred_at !== undefined && payload.occurred_at !== null) {
+      if (typeof payload.occurred_at !== "string") {
+        return jsonResponse({
+          ok: false,
+          error: "Invalid event timestamp."
+        }, 400);
+      }
+
+      const occurredMilliseconds = Date.parse(payload.occurred_at);
+
+      if (!Number.isFinite(occurredMilliseconds)) {
+        return jsonResponse({
+          ok: false,
+          error: "Invalid event timestamp."
+        }, 400);
+      }
+
+      occurredAt = new Date(occurredMilliseconds).toISOString();
+      eventDay = occurredAt.slice(0, 10);
+    }
+
+    // --------------------------------------------------------
+    // 8. Require an existing Rapid Ads user.
+    // The LiteBits event table has a foreign key to users.
+    // --------------------------------------------------------
+
+    const db = getDatabase(env);
+    const telegramIdString = String(telegramId);
+
+    const registeredUser = await getRegisteredUser(
+      db,
+      telegramIdString
+    );
+
+    if (!registeredUser) {
+      // Acknowledge the valid callback so LiteBits does not
+      // repeatedly retry an event for an unregistered account.
+      console.warn(
+        "LiteBits event ignored: Telegram user is not registered.",
+        eventId
+      );
+
+      return jsonResponse({
+        ok: true,
+        ignored: true,
+        reason: "USER_NOT_REGISTERED"
+      });
+    }
+
+    // --------------------------------------------------------
+    // 9. Prepare event and reward records.
+    // No FaucetPay request is made in this handler.
+    // --------------------------------------------------------
+
+    const nowSeconds = unixTime();
+    const rewardId = randomId("litebits_reward");
+
+    const eligible =
+      earningSats >= CONFIG.LITEBITS_MINIMUM_EARNING_SATS;
+
+    // --------------------------------------------------------
+    // 10. Insert event, create reward if eligible, and update
+    // event status in one transactional D1 batch.
+    //
+    // Repeated event IDs cannot create duplicate rewards.
+    // --------------------------------------------------------
+
+    const statements = [
+      db.prepare(`
+        INSERT OR IGNORE INTO litebits_events (
+          event_id,
+          delivery_id,
+          placement_id,
+          telegram_id,
+          earning_sats,
+          occurred_at,
+          event_day,
+          processing_status,
+          received_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'RECEIVED', ?)
+      `).bind(
+        eventId,
+        deliveryId,
+        placementId,
+        telegramIdString,
+        earningSats,
+        occurredAt,
+        eventDay,
+        nowSeconds
+      ),
+
+      db.prepare(`
+        INSERT INTO litebits_rewards (
+          id,
+          event_id,
+          telegram_id,
+          earning_sats,
+          minimum_earning_sats,
+          amount_units,
+          currency,
+          status,
+          created_at,
+          updated_at
+        )
+        SELECT
+          ?,
+          event_id,
+          telegram_id,
+          earning_sats,
+          ?,
+          ?,
+          'USDT',
+          'PENDING',
+          ?,
+          ?
+        FROM litebits_events
+        WHERE event_id = ?
+          AND processing_status = 'RECEIVED'
+          AND earning_sats >= ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM litebits_rewards
+            WHERE event_id = ?
+          )
+      `).bind(
+        rewardId,
+        CONFIG.LITEBITS_MINIMUM_EARNING_SATS,
+        CONFIG.LITEBITS_REWARD_UNITS,
+        nowSeconds,
+        nowSeconds,
+        eventId,
+        CONFIG.LITEBITS_MINIMUM_EARNING_SATS,
+        eventId
+      ),
+
+      db.prepare(`
+        UPDATE litebits_events
+        SET processing_status = CASE
+          WHEN EXISTS (
+            SELECT 1
+            FROM litebits_rewards
+            WHERE litebits_rewards.event_id = litebits_events.event_id
+          )
+          THEN 'REWARD_CREATED'
+          ELSE 'BELOW_THRESHOLD'
+        END
+        WHERE event_id = ?
+          AND processing_status = 'RECEIVED'
+      `).bind(eventId)
+    ];
+
+    const results = await db.batch(statements);
+
+    const eventInserted = Number(
+      results[0]?.meta?.changes || 0
+    );
+
+    // --------------------------------------------------------
+    // 11. Handle duplicate callbacks safely.
+    // --------------------------------------------------------
+
+    if (eventInserted !== 1) {
+      return jsonResponse({
+        ok: true,
+        duplicate: true,
+        event_id: eventId,
+        message: "This LiteBits event has already been processed."
+      });
+    }
+
+    const rewardCreated = Number(
+      results[1]?.meta?.changes || 0
+    );
+
+    // --------------------------------------------------------
+    // 12. Confirm the result.
+    // --------------------------------------------------------
+
+    if (eligible && rewardCreated !== 1) {
+      console.error(
+        "LiteBits eligible event did not create its reward.",
+        eventId
+      );
+
+      return jsonResponse({
+        ok: false,
+        error: "Reward recording failed."
+      }, 500);
+    }
+
+    if (!eligible) {
+      return jsonResponse({
+        ok: true,
+        recorded: true,
+        eligible: false,
+        event_id: eventId,
+        earning_sats: earningSats,
+        minimum_earning_sats: CONFIG.LITEBITS_MINIMUM_EARNING_SATS,
+        reward_created: false,
+        payout_status: "NOT_APPLICABLE"
+      });
+    }
+
+    return jsonResponse({
+      ok: true,
+      recorded: true,
+      eligible: true,
+      event_id: eventId,
+      earning_sats: earningSats,
+      reward_created: true,
+      reward_amount_units: CONFIG.LITEBITS_REWARD_UNITS,
+      reward_currency: "USDT",
+      reward_status: "PENDING",
+      payout_status: "DISABLED",
+      message: "Verified LiteBits reward recorded. No payment has been sent."
+    });
+
+  } catch (error) {
+    console.error("LiteBits callback error:", error);
+
+    return jsonResponse({
+      ok: false,
+      error: "LiteBits callback processing failed."
+    }, 500);
+  }
+ }
 
 // ============================================================
 // PAYMENT HISTORY
