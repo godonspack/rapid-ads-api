@@ -29,10 +29,14 @@ const CONFIG = {
   TELEGRAM_CHANNEL_ID: "@rapidads_channel",
   TELEGRAM_CHANNEL_URL: "https://t.me/rapidads_channel",
 
-    // LiteBits — safe mode (record rewards only; no payouts)
-  LITEBITS_PLACEMENT_ID: "bee02ff9-a9f0-41c0-987c-7762f4bda93e",
-  LITEBITS_REWARD_UNITS: 10000,
-  LITEBITS_MINIMUM_EARNING_SATS: 2,
+ // LiteBits — safe mode (record rewards only; no payouts)
+LITEBITS_PLACEMENT_ID: "bee02ff9-a9f0-41c0-987c-7762f4bda93e",
+LITEBITS_REWARD_UNITS: 10000,
+LITEBITS_MINIMUM_EARNING_SATS: 2,
+
+// Telemonix — Promotional Reward
+TELEMONIX_PROMO_REWARD_UNITS: 10000,
+TELEMONIX_PROMO_CURRENCY: "USDT",
 
   PAYOUTS_ENABLED: true
 };
@@ -106,6 +110,11 @@ export default {
 
       if (path === "/payment-status" && request.method === "POST") {
         return await handlePaymentStatus(request, env);
+      }
+
+      if (path === "/telemonix-promo-claim" &&
+  request.method === "POST") {
+  return await handleTelemonixPromoClaim(request, env);
       }
 
       return jsonResponse({
